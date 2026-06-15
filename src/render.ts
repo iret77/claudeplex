@@ -125,6 +125,8 @@ function ctxColor(pct: number): number {
 /** Compact inline cluster: context % (colored) · model family · thinking. */
 function ctxModelSuffix(ss: SessionSummary): string {
   const parts: string[] = [];
+  if (ss.bgShells > 0) parts.push(`${fg(45)}⚙${ss.bgShells}${RESET}`);
+  else if (ss.bg) parts.push(`${fg(45)}⚙${RESET}`);
   if (ss.ctxTokens > 0) {
     const pct = ss.ctxTokens / ctxMaxFor(ss.model, ss.ctxTokens);
     parts.push(`${fg(ctxColor(pct))}${Math.round(pct * 100)}%${RESET}`);
@@ -441,7 +443,8 @@ function renderGrid(
     const cells = states.map((s) => {
       const cnt = (st: string) => s.sessions.filter((x) => x.state === st).length;
       const a = cnt("aktiv"), m = cnt("monitor"), wt = cnt("wartet"), sl = cnt("stale");
-      const ses = [a && `${fg(46)}◆${a}${RESET}`, m && `${fg(39)}◑${m}${RESET}`, wt && `${fg(220)}◐${wt}${RESET}`, sl && `${fg(245)}○${sl}${RESET}`].filter(Boolean).join(" ");
+      const bgN = s.sessions.filter((x) => x.bg || x.bgShells > 0).length;
+      const ses = [a && `${fg(46)}◆${a}${RESET}`, m && `${fg(39)}◑${m}${RESET}`, wt && `${fg(220)}◐${wt}${RESET}`, sl && `${fg(245)}○${sl}${RESET}`, bgN && `${fg(45)}⚙${bgN}${RESET}`].filter(Boolean).join(" ");
       return `${fg(s.def.color)}${BOLD}${s.def.key}${RESET} ${fg(s.def.color)}${s.def.label}${RESET} ` +
         `${loadTag("5h", s.block5h.work, BUDGET_5H)} ${loadTag("wk", s.week.work, BUDGET_WEEK)}` +
         (ses ? `  ${ses}` : "");
@@ -525,7 +528,7 @@ function renderGrid(
 
   out.push("");
   out.push(
-    `${fg(46)}◆ ${stateLabel("aktiv")}${RESET} ${DIM}·${RESET} ${fg(39)}◑ ${stateLabel("monitor")}${RESET} ${DIM}·${RESET} ${fg(220)}◐ ${stateLabel("wartet")}${RESET} ${DIM}·${RESET} ${fg(245)}○ ${stateLabel("stale")}${RESET}`,
+    `${fg(46)}◆ ${stateLabel("aktiv")}${RESET} ${DIM}·${RESET} ${fg(39)}◑ ${stateLabel("monitor")}${RESET} ${DIM}·${RESET} ${fg(220)}◐ ${stateLabel("wartet")}${RESET} ${DIM}·${RESET} ${fg(245)}○ ${stateLabel("stale")}${RESET} ${DIM}·${RESET} ${fg(45)}⚙ background${RESET}`,
   );
   out.push(
     qFocus
@@ -582,7 +585,8 @@ function renderDetail(states: InstanceState[], frame: number, now: number, W: nu
           : `${fg(accent)}📊${RESET} ${DIM}Context —${RESET}`;
         const mdlStr = ss.model ? `  ${DIM}·${RESET} ${fg(modelColor(ss.model))}${prettyModel(ss.model)}${RESET}` : "";
         const thinkStr = ss.thinking ? `  ${DIM}·${RESET} 🧠 ${DIM}Thinking${RESET}` : "";
-        content.push("      " + trunc(`${ctxStr}${mdlStr}${thinkStr}`, textW - 6));
+        const bgStr = ss.bgShells ? `  ${DIM}·${RESET} ${fg(45)}⚙ ${ss.bgShells} bg${RESET}` : ss.bg ? `  ${DIM}·${RESET} ${fg(45)}⚙ background${RESET}` : "";
+        content.push("      " + trunc(`${ctxStr}${mdlStr}${thinkStr}${bgStr}`, textW - 6));
         content.push(`      ${DIM}id ${ss.sessionId.slice(0, 8)}${RESET}`);
         const arrow = ss.working ? `${fg(sc)}${STREAM[frame % STREAM.length]}${RESET}` : `${DIM}⟩${RESET}`;
         const lines = wrap(ss.activity || "—", textW - 10, 4);

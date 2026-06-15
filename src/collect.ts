@@ -30,6 +30,7 @@ export interface SessionMeta {
   model: string; // model id of the latest assistant message
   ctxTokens: number; // context window fill of the latest turn (input+cache read+create)
   thinking: boolean; // latest assistant turn used extended thinking
+  bgShells: number; // running run_in_background shells (launches minus kills)
 }
 
 export type Status = "WORKING" | "LIVE" | "IDLE" | "OFFLINE";
@@ -59,6 +60,8 @@ export interface SessionSummary {
   model: string; // model id of the latest assistant message
   ctxTokens: number; // context window fill of the latest turn
   thinking: boolean; // latest turn used extended thinking
+  bg: boolean; // session is a background job (registry kind === "bg")
+  bgShells: number; // running run_in_background shells inside this session
   pid: number; // OS pid of the running session process (0 = history)
 }
 
@@ -176,12 +179,15 @@ function parseSessionFile(path: string, sessionId: string): ParsedSession {
     model: "",
     ctxTokens: 0,
     thinking: false,
+    bgShells: 0,
   };
 
   let aiTitle = "";
   let customTitle = "";
   let firstPrompt = "";
   let lastKind = ""; // assistant_end | assistant_tool | tool_result | user
+  let bgLaunch = 0; // run_in_background Bash launches
+  let bgKill = 0; // KillShell calls
   const text = readFileSync(path, "utf8");
   for (const line of text.split("\n")) {
     if (!line) continue;
@@ -228,8 +234,11 @@ function parseSessionFile(path: string, sessionId: string): ParsedSession {
       let thinking = false;
       for (const p of o.message.content) {
         if (p?.type === "text" && typeof p.text === "string" && p.text.trim()) meta.turns++;
-        else if (p?.type === "tool_use") meta.tools++;
-        else if (p?.type === "thinking") thinking = true;
+        else if (p?.type === "tool_use") {
+          meta.tools++;
+          if (p.name === "Bash" && p.input?.run_in_background === true) bgLaunch++;
+          else if (p.name === "KillShell") bgKill++;
+        } else if (p?.type === "thinking") thinking = true;
       }
       lastKind = o.message.stop_reason === "tool_use" ? "assistant_tool" : "assistant_end";
       // latest-turn snapshot: model, context window fill, thinking
@@ -261,6 +270,7 @@ function parseSessionFile(path: string, sessionId: string): ParsedSession {
   }
 
   meta.title = customTitle || aiTitle || firstPrompt;
+  meta.bgShells = Math.max(0, bgLaunch - bgKill);
   meta.ended = lastKind === "assistant_end";
   const parsed: ParsedSession = { mtimeMs: st.mtimeMs, size: st.size, entries, meta };
   cache.set(path, parsed);
@@ -425,8 +435,9 @@ function isRealReg(r: RegEntry): boolean {
   return true;
 }
 
-function stateOf(status: string, ended: boolean): SessState {
+function stateOf(status: string, ended: boolean, background: boolean): SessState {
   if (status === "busy") return "aktiv";
+  if (background) return "monitor"; // a live background job: active, not waiting/stale
   return ended ? "wartet" : "monitor";
 }
 
@@ -481,6 +492,8 @@ export function collectInstance(
       }
       const ended = m ? m.ended : true;
       const lastTs = Math.max(m?.lastTs ?? 0, r.updatedAt, r.startedAt);
+      const bg = r.kind === "bg";
+      const bgShells = m?.bgShells ?? 0;
       return {
         sessionId: r.sessionId,
         path: path ?? "",
@@ -493,11 +506,13 @@ export function collectInstance(
         working: r.status === "busy",
         live: true,
         ended,
-        state: stateOf(r.status, ended),
+        state: stateOf(r.status, ended, bg),
         regStatus: r.status,
         model: m?.model ?? "",
         ctxTokens: m?.ctxTokens ?? 0,
         thinking: m?.thinking ?? false,
+        bg,
+        bgShells,
         pid: r.pid,
       };
     })
@@ -531,6 +546,8 @@ export function collectInstance(
       model: m.model,
       ctxTokens: m.ctxTokens,
       thinking: m.thinking,
+      bg: false,
+      bgShells: 0,
       pid: 0,
     }));
 
