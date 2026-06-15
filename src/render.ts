@@ -439,10 +439,12 @@ function renderGrid(
 
   if (ui.collapsed.cards) {
     const cells = states.map((s) => {
-      const liveN = s.sessions.filter((x) => x.live).length;
+      const cnt = (st: string) => s.sessions.filter((x) => x.state === st).length;
+      const a = cnt("aktiv"), m = cnt("monitor"), wt = cnt("wartet"), sl = cnt("stale");
+      const ses = [a && `${fg(46)}◆${a}${RESET}`, m && `${fg(39)}◑${m}${RESET}`, wt && `${fg(220)}◐${wt}${RESET}`, sl && `${fg(245)}○${sl}${RESET}`].filter(Boolean).join(" ");
       return `${fg(s.def.color)}${BOLD}${s.def.key}${RESET} ${fg(s.def.color)}${s.def.label}${RESET} ` +
         `${loadTag("5h", s.block5h.work, BUDGET_5H)} ${loadTag("wk", s.week.work, BUDGET_WEEK)}` +
-        (liveN ? ` ${fg(51)}${liveN}↑${RESET}` : "");
+        (ses ? `  ${ses}` : "");
     });
     out.push(`  ${region === "cards" ? fg(231) : DIM}▸ ① ${t("cards")}${RESET}   ${cells.join(`  ${DIM}│${RESET}  `)}`);
     out.push("");
