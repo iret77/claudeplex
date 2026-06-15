@@ -492,7 +492,7 @@ export function collectInstance(
       }
       const ended = m ? m.ended : true;
       const lastTs = Math.max(m?.lastTs ?? 0, r.updatedAt, r.startedAt);
-      const bg = r.kind === "bg";
+      const bg = r.kind === "bg" && (r.status === "busy" || now - r.updatedAt < ACTIVE_MS);
       const bgShells = m?.bgShells ?? 0;
       return {
         sessionId: r.sessionId,
