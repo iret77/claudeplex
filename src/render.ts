@@ -438,7 +438,13 @@ function renderGrid(
   out.push("");
 
   if (ui.collapsed.cards) {
-    out.push(`  ${region === "cards" ? fg(231) : DIM}▸ ① ${t("cards")} (${states.length})${RESET}`);
+    const cells = states.map((s) => {
+      const liveN = s.sessions.filter((x) => x.live).length;
+      return `${fg(s.def.color)}${BOLD}${s.def.key}${RESET} ${fg(s.def.color)}${s.def.label}${RESET} ` +
+        `${loadTag("5h", s.block5h.work, BUDGET_5H)} ${loadTag("wk", s.week.work, BUDGET_WEEK)}` +
+        (liveN ? ` ${fg(51)}${liveN}↑${RESET}` : "");
+    });
+    out.push(`  ${region === "cards" ? fg(231) : DIM}▸ ① ${t("cards")}${RESET}   ${cells.join(`  ${DIM}│${RESET}  `)}`);
     out.push("");
   } else {
     for (let i = 0; i < cards.length; i += cols) {
@@ -466,8 +472,8 @@ function renderGrid(
     out.push(`  ${fg(213)}✎ ${t("renameLabel")}${RESET} ${ui.input}${caret}   ${DIM}${t("saveCancel")}${RESET}`);
   }
   if (!qs.length) out.push(`  ${DIM}${t("noSessions")}${RESET}`);
-  const TW = 22; // title column width
-  const WTW = 18; // worktree column width
+  const TW = 30; // title column width
+  const WTW = 24; // worktree column width
   if (qs.length) {
     out.push(`  ${DIM}${pad("INST", 4)} ${pad("STATE", 7)} ${pad(t("colTitle"), TW)} ${pad("WORKTREE", WTW)} ${t("colLast")}${RESET}`);
   }
@@ -476,11 +482,11 @@ function renderGrid(
   const repoKeyOf = (w: WaitingSession) => repoSlug(w.ss.cwd) || dirName(w.ss.cwd);
   const grpCount = new Map<string, number>();
   for (const w of qs) grpCount.set(repoKeyOf(w), (grpCount.get(repoKeyOf(w)) ?? 0) + 1);
-  const disp: { header?: string; count?: number; w?: WaitingSession; i?: number }[] = [];
+  const disp: { header?: string; count?: number; w?: WaitingSession; i?: number; spacer?: boolean }[] = [];
   let prevKey = "";
   qs.forEach((w, i) => {
     const k = repoKeyOf(w);
-    if (k !== prevKey) { disp.push({ header: k, count: grpCount.get(k) }); prevKey = k; }
+    if (k !== prevKey) { if (disp.length) disp.push({ spacer: true }); disp.push({ header: k, count: grpCount.get(k) }); prevKey = k; }
     disp.push({ w, i });
   });
   const qMax = Math.max(3, height - out.length - 5);
@@ -489,7 +495,8 @@ function renderGrid(
   const view = disp.slice(startD, startD + qMax);
   const hiddenAbove = disp.slice(0, startD).filter((d) => d.w).length;
   if (hiddenAbove > 0) out.push(`  ${DIM}↑ ${hiddenAbove} ${t("further")}${RESET}`);
-  view.forEach((d) => {
+  view.forEach((d, vi) => {
+    if (d.spacer) { if (vi > 0) out.push(""); return; }
     if (d.header !== undefined) {
       out.push(`  ${fg(74)}📦 ${d.header}${RESET} ${DIM}(${d.count})${RESET}`);
       return;
