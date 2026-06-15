@@ -311,6 +311,8 @@ export interface UIState {
   pickerMode: "instance" | "folder"; // wizard orientation: instance→folder | folder→instance
   // grid: which of the three regions has focus (Tab / 1-3)
   gridRegion: "cards" | "live" | "questions";
+  // grid: which regions are collapsed (double-press 1/2/3 to toggle)
+  collapsed: { cards: boolean; live: boolean; questions: boolean };
   closeArm: string; // sessionId armed for close-confirm in the questions list
   renaming: string; // sessionId being renamed ("" = not renaming); buffer = input
   // quick-issue flow (picker === "issue")
@@ -359,11 +361,12 @@ export function closeableSessions(states: InstanceState[]): WaitingSession[] {
 
 /** Live tail (last 5 lines) of each actively-working session, below the grid.
  *  Tools/results are progressively indented to show the call hierarchy. */
-function liveOutputBlock(states: InstanceState[], W: number, focused = false): string[] {
+function liveOutputBlock(states: InstanceState[], W: number, focused = false, collapsed = false): string[] {
   const active = states.flatMap((s) => s.sessions.filter((x) => x.working).map((ss) => ({ s, ss })));
   const out: string[] = [""];
   const hcol = focused ? 231 : 46;
-  out.push(rule(`${BOLD}${fg(hcol)}② LIVE OUTPUT${RESET} `, ` ${DIM}${active.length} ${t("active")}${RESET}`, W, "━", focused ? 231 : 240));
+  out.push(rule(`${BOLD}${fg(hcol)}${collapsed ? "▸" : "▾"} ② LIVE OUTPUT${RESET} `, ` ${DIM}${active.length} ${t("active")}${RESET}`, W, "━", focused ? 231 : 240));
+  if (collapsed) return out;
   if (!active.length) {
     out.push(`  ${DIM}${t("noSessionGenerating")}${RESET}`);
     return out;
@@ -430,17 +433,22 @@ function renderGrid(
     on ? `${bg(238)}${fg(231)}${BOLD} ${num} ${label} ${RESET}` : `${DIM} ${num} ${label} ${RESET}`;
   out.push(
     `${chip("①", t("cards"), region === "cards")}  ${chip("②", "Live", region === "live")}  ` +
-    `${chip("③", t("openQuestions"), region === "questions")}   ${DIM}${t("switchInstances1to3")}${RESET}`,
+    `${chip("③", t("openQuestions"), region === "questions")}   ${DIM}${t("switchInstances1to3")} · 2× ▾/▸${RESET}`,
   );
   out.push("");
 
-  for (let i = 0; i < cards.length; i += cols) {
-    for (const line of gridRow(cards.slice(i, i + cols), gap)) out.push(line);
+  if (ui.collapsed.cards) {
+    out.push(`  ${region === "cards" ? fg(231) : DIM}▸ ① ${t("cards")} (${states.length})${RESET}`);
     out.push("");
+  } else {
+    for (let i = 0; i < cards.length; i += cols) {
+      for (const line of gridRow(cards.slice(i, i + cols), gap)) out.push(line);
+      out.push("");
+    }
   }
 
   // ② live output
-  for (const l of liveOutputBlock(states, W, region === "live")) out.push(l);
+  for (const l of liveOutputBlock(states, W, region === "live", ui.collapsed.live)) out.push(l);
 
   // ③ waiting for input + stale — closeable sessions with last message
   const qs = closeableSessions(states);
@@ -449,9 +457,10 @@ function renderGrid(
   const st = qs.length - ws;
   out.push("");
   out.push(rule(
-    `${BOLD}${fg(qFocus ? 231 : 220)}③ WAITING / STALE${RESET} ${DIM}(${ws} ${stateLabel("wartet")} · ${st} stale)${RESET} `,
+    `${BOLD}${fg(qFocus ? 231 : 220)}${ui.collapsed.questions ? "▸" : "▾"} ③ WAITING / STALE${RESET} ${DIM}(${ws} ${stateLabel("wartet")} · ${st} stale)${RESET} `,
     qFocus ? ` ${DIM}↑/↓ ${t("select")} · ⏎ ${t("openVerb")} · e ${t("rename")} · x ${t("close")}${RESET} ` : "", W, "━", qFocus ? 231 : 240,
   ));
+  if (!ui.collapsed.questions) {
   if (ui.renaming) {
     const caret = Math.floor(frame / 3) % 2 === 0 ? `${fg(231)}▏${RESET}` : " ";
     out.push(`  ${fg(213)}✎ ${t("renameLabel")}${RESET} ${ui.input}${caret}   ${DIM}${t("saveCancel")}${RESET}`);
@@ -503,6 +512,7 @@ function renderGrid(
   const shown = view.filter((d) => d.w).length;
   const below = qs.length - hiddenAbove - shown;
   if (below > 0) out.push(`  ${DIM}↓ ${below} ${t("further")}${RESET}`);
+  }
 
   out.push("");
   out.push(
@@ -1307,7 +1317,7 @@ export function render(
     sel: -1, expanded: false, sessSel: 0, transcript: false, scroll: 0,
     cockpit: false, focus: "", input: "", cockpitArea: "input", listSel: 0, pendingImages: [],
     picker: "", pickerInput: "", pickerSel: 0, pickerInstance: "", pickerPane: "instance", pickerInstSel: 0,
-    pickerMode: "instance", gridRegion: "cards", closeArm: "", renaming: "",
+    pickerMode: "instance", gridRegion: "cards", collapsed: { cards: false, live: false, questions: false }, closeArm: "", renaming: "",
     issueStage: "pick", issuePane: "folder", issueFolderSel: 0, issueInput: "", issueFeedback: "",
     issueDraft: "", issueScroll: 0, issueRepo: "", issueInstance: "", issueUrl: "", issueError: "",
   };

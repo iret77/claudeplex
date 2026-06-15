@@ -101,7 +101,7 @@ function runLoop(): void {
     sel: 0, expanded: false, sessSel: 0, transcript: false, scroll: 0,
     cockpit: false, focus: "", input: "", cockpitArea: "input", listSel: 0, pendingImages: [],
     picker: "", pickerInput: "", pickerSel: 0, pickerInstance: "", pickerPane: "instance", pickerInstSel: 0,
-    pickerMode: "instance", gridRegion: "cards", closeArm: "", renaming: "",
+    pickerMode: "instance", gridRegion: "cards", collapsed: { cards: false, live: false, questions: false }, closeArm: "", renaming: "",
     issueStage: "pick", issuePane: "folder", issueFolderSel: 0, issueInput: "", issueFeedback: "",
     issueDraft: "", issueScroll: 0, issueRepo: "", issueInstance: "", issueUrl: "", issueError: "",
   };
@@ -628,14 +628,16 @@ function runLoop(): void {
           ui.listSel = 0;
           ui.closeArm = "";
         } else if (k === "1") {
-          ui.gridRegion = "cards";
+          if (ui.gridRegion === "cards") ui.collapsed.cards = !ui.collapsed.cards;
+          else ui.gridRegion = "cards";
           ui.closeArm = "";
         } else if (k === "2") {
-          ui.gridRegion = "live";
+          if (ui.gridRegion === "live") ui.collapsed.live = !ui.collapsed.live;
+          else ui.gridRegion = "live";
           ui.closeArm = "";
         } else if (k === "3") {
-          ui.gridRegion = "questions";
-          ui.listSel = 0;
+          if (ui.gridRegion === "questions") ui.collapsed.questions = !ui.collapsed.questions;
+          else { ui.gridRegion = "questions"; ui.listSel = 0; }
           ui.closeArm = "";
         } else if (ui.gridRegion === "questions" && (k === "x" || k === "X")) {
           // close a session: first x arms, second x terminates (if running) + hides it
