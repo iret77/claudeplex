@@ -1,13 +1,16 @@
-import { homedir } from "node:os";
-import { join } from "node:path";
-
 /**
- * The four isolated Claude Code accounts (c1–c4 in ~/.zshrc).
- * Each one runs under its own CLAUDE_CONFIG_DIR. We never write to these dirs —
- * the dashboard only reads sessions, usage and account metadata.
+ * An instance is one isolated Claude Code account, identified by its
+ * CLAUDE_CONFIG_DIR. Claudeplex never writes to these dirs — it only reads
+ * sessions, usage and account metadata.
+ *
+ * The live list is built at startup by `discoverInstances()` (see discover.ts),
+ * which scans the filesystem, running processes and $CLAUDE_CONFIG_DIR. This
+ * seed is only the fallback when discovery finds nothing; keep it empty so the
+ * tool ships with zero machine-specific configuration. Pin labels/colors via
+ * the optional overrides file instead (see discover.ts).
  */
 export interface InstanceDef {
-  /** shell shortcut name, e.g. "c1" */
+  /** short key shown in the UI, e.g. "c1" */
   key: string;
   /** short human label shown in the UI */
   label: string;
@@ -17,14 +20,7 @@ export interface InstanceDef {
   configDir: string;
 }
 
-const HOME = homedir();
-
-export const INSTANCES: InstanceDef[] = [
-  { key: "c1", label: "claw",         color: 81,  configDir: join(HOME, ".claude-claw") },
-  { key: "c2", label: "byte5-priv",   color: 213, configDir: join(HOME, ".claude-byte5-priv") },
-  { key: "c3", label: "byte5-team",   color: 156, configDir: join(HOME, ".claude-byte5-team") },
-  { key: "c4", label: "byte5-omadia", color: 215, configDir: join(HOME, ".claude-byte5-omadia") },
-];
+export const INSTANCES: InstanceDef[] = [];
 
 /**
  * Soft token budget used only to draw the load bar as a percentage.

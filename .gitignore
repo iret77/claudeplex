@@ -11,3 +11,12 @@ node_modules/
 .env
 .env.*
 !.env.example
+
+# Claude Code local working dir (worktrees, local settings) — never publish
+.claude/
+
+# Build output (binaries are published to GitHub Releases, not committed)
+dist/
+
+# Internal design notes (not for the public repo)
+docs/superpowers/

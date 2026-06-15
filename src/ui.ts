@@ -15,10 +15,40 @@ export const rgb = (r: number, g: number, b: number) => `\x1b[38;2;${r};${g};${b
 
 const ANSI = /^\x1b\[[0-9;]*m/;
 
+/**
+ * Within the Misc-Symbols + Dingbats block (0x2600–0x27BF) only the
+ * emoji-presentation codepoints (East-Asian-Width = Wide) take two terminal
+ * cells. The rest — ✓ ✗ ❯ ✎ and most arrows/symbols — are Neutral and draw
+ * as one cell. Treating the whole block as wide miscounts those by +1 each,
+ * which drifts box borders left and shatters the frame. This is the precise
+ * Wide subset per Unicode EAW.
+ */
+function isWideSymbol(cp: number): boolean {
+  return (
+    cp === 0x2614 || cp === 0x2615 ||
+    (cp >= 0x2648 && cp <= 0x2653) ||
+    cp === 0x267f ||
+    cp === 0x2693 || cp === 0x26a1 ||
+    (cp >= 0x26aa && cp <= 0x26ab) ||
+    (cp >= 0x26bd && cp <= 0x26be) ||
+    (cp >= 0x26c4 && cp <= 0x26c5) ||
+    cp === 0x26ce || cp === 0x26d4 || cp === 0x26ea ||
+    (cp >= 0x26f2 && cp <= 0x26f3) ||
+    cp === 0x26f5 || cp === 0x26fa || cp === 0x26fd ||
+    cp === 0x2705 ||
+    (cp >= 0x270a && cp <= 0x270b) ||
+    cp === 0x2728 || cp === 0x274c || cp === 0x274e ||
+    (cp >= 0x2753 && cp <= 0x2755) ||
+    cp === 0x2757 ||
+    (cp >= 0x2795 && cp <= 0x2797) ||
+    cp === 0x27b0 || cp === 0x27bf
+  );
+}
+
 function isWide(cp: number): boolean {
   return (
     (cp >= 0x1100 && cp <= 0x115f) ||
-    (cp >= 0x2600 && cp <= 0x27bf) || // misc symbols + dingbats (✅ ✨ ⚡)
+    isWideSymbol(cp) || // emoji-presentation symbols in the misc/dingbats block
     (cp >= 0x2e80 && cp <= 0xa4cf) ||
     (cp >= 0xac00 && cp <= 0xd7a3) ||
     (cp >= 0xf900 && cp <= 0xfaff) ||
@@ -138,6 +168,57 @@ export function heat(pct: number): number {
   if (pct >= 0.6) return 214; // orange
   if (pct >= 0.35) return 220; // yellow
   return 46; // green
+}
+
+/**
+ * Drop the first `n` visible columns, keeping any still-active SGR color so the
+ * remainder renders correctly. ANSI escapes are zero-width.
+ */
+export function dropCols(s: string, n: number): string {
+  let w = 0;
+  let i = 0;
+  let active = "";
+  while (i < s.length && w < n) {
+    const m = s.slice(i).match(ANSI);
+    if (m) {
+      active = m[0] === RESET ? "" : active + m[0];
+      i += m[0].length;
+      continue;
+    }
+    const cp = s.codePointAt(i)!;
+    const ch = String.fromCodePoint(cp);
+    if (cp === 0xfe0f || cp === 0x200d) {
+      i += ch.length;
+      continue;
+    }
+    w += isWide(cp) ? 2 : 1;
+    i += ch.length;
+  }
+  // absorb any escapes sitting exactly at the cut so colors carry over
+  let m: RegExpMatchArray | null;
+  while ((m = s.slice(i).match(ANSI))) {
+    active = m[0] === RESET ? "" : active + m[0];
+    i += m[0].length;
+  }
+  return active + s.slice(i);
+}
+
+/**
+ * Composite `box` lines onto `base` at (top,left). The box is opaque: its own
+ * cells (incl. spaces) overwrite the backdrop; the backdrop shows only outside.
+ * Used to float a popup/modal over the dashboard instead of a full-screen page.
+ */
+export function overlayBox(base: string[], box: string[], top: number, left: number): string[] {
+  const out = base.slice();
+  while (out.length < top + box.length) out.push("");
+  for (let r = 0; r < box.length; r++) {
+    const row = top + r;
+    const bw = vwidth(box[r]);
+    const head = pad(out[row] ?? "", left); // left backdrop margin
+    const tail = dropCols(out[row] ?? "", left + bw); // backdrop to the right
+    out[row] = head + RESET + box[r] + RESET + tail;
+  }
+  return out;
 }
 
 export const ansiLen = vwidth;

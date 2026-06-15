@@ -1,6 +1,6 @@
-import { readdirSync, statSync, readFileSync } from "node:fs";
+import { readdirSync, statSync, readFileSync, openSync, readSync, closeSync } from "node:fs";
 import { join } from "node:path";
-import { INSTANCES, type InstanceDef } from "./instances.ts";
+import type { InstanceDef } from "./instances.ts";
 import {
   blockResetAt,
   bucketEntries,
@@ -552,9 +552,126 @@ export function collectInstance(
   return { def, account, status, running: isRunningNow, sessions, block5h, today, week, reset5h, resetWk };
 }
 
-export function collectAll(now = Date.now()): InstanceState[] {
+export function collectAll(instances: InstanceDef[], now = Date.now()): InstanceState[] {
   const running = getRunningConfigDirs();
-  return INSTANCES.map((def) => collectInstance(def, now, running));
+  return instances.map((def) => collectInstance(def, now, running));
+}
+
+/** Read the first `bytes` of a file (transcripts start with a cwd-bearing line). */
+function readHead(path: string, bytes = 65536): string {
+  const fd = openSync(path, "r");
+  try {
+    const buf = Buffer.alloc(bytes);
+    const n = readSync(fd, buf, 0, bytes, 0);
+    return buf.toString("utf8", 0, n);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** The launch cwd of a transcript: first JSON line carrying a `cwd` field. */
+function firstCwd(path: string): string {
+  try {
+    let scanned = 0;
+    for (const line of readHead(path).split("\n")) {
+      if (!line) continue;
+      const o = safeJson<any>(line);
+      if (o?.cwd) return o.cwd;
+      if (++scanned > 50) break;
+    }
+  } catch {
+    /* unreadable */
+  }
+  return "";
+}
+
+export interface FolderHist {
+  cwd: string;
+  lastTs: number;
+}
+
+const folderCache = new Map<string, { mtimeMs: number; folders: FolderHist[] }>();
+
+/**
+ * Every working folder this instance has ever had a session in — read from the
+ * full `projects/` history (not just the recent window), recency-sorted. Only
+ * each project's newest transcript head is read (for its cwd), and the result is
+ * cached against the projects-dir mtime so repeated frames are cheap.
+ */
+export function instanceFolders(configDir: string): FolderHist[] {
+  const projectsDir = join(configDir, "projects");
+  let dmt = 0;
+  try {
+    dmt = statSync(projectsDir).mtimeMs;
+  } catch {
+    return [];
+  }
+  const hit = folderCache.get(configDir);
+  if (hit && hit.mtimeMs === dmt) return hit.folders;
+
+  const byCwd = new Map<string, number>();
+  let projectDirs: string[];
+  try {
+    projectDirs = readdirSync(projectsDir);
+  } catch {
+    return [];
+  }
+  for (const pd of projectDirs) {
+    const full = join(projectsDir, pd);
+    let newest: { p: string; mt: number } | null = null;
+    try {
+      if (!statSync(full).isDirectory()) continue;
+      for (const n of readdirSync(full)) {
+        if (!n.endsWith(".jsonl")) continue;
+        const p = join(full, n);
+        const mt = statSync(p).mtimeMs;
+        if (!newest || mt > newest.mt) newest = { p, mt };
+      }
+    } catch {
+      continue;
+    }
+    if (!newest) continue;
+    const cwd = firstCwd(newest.p);
+    if (cwd && /observer-sessions|\.claude-mem/.test(cwd) === false) {
+      byCwd.set(cwd, Math.max(byCwd.get(cwd) ?? 0, newest.mt));
+    }
+  }
+  const folders = [...byCwd.entries()]
+    .map(([cwd, lastTs]) => ({ cwd, lastTs }))
+    .sort((a, b) => b.lastTs - a.lastTs);
+  folderCache.set(configDir, { mtimeMs: dmt, folders });
+  return folders;
+}
+
+export interface FolderUsage {
+  cwd: string;
+  lastTs: number;
+  users: { key: string; lastTs: number }[]; // instances that ran here, newest first
+}
+
+/** All folders across all instances, each with the instances that used it. */
+export function allFolders(instances: InstanceDef[]): FolderUsage[] {
+  const map = new Map<string, { lastTs: number; users: Map<string, number> }>();
+  for (const def of instances) {
+    for (const f of instanceFolders(def.configDir)) {
+      let e = map.get(f.cwd);
+      if (!e) {
+        e = { lastTs: 0, users: new Map() };
+        map.set(f.cwd, e);
+      }
+      e.lastTs = Math.max(e.lastTs, f.lastTs);
+      e.users.set(def.key, Math.max(e.users.get(def.key) ?? 0, f.lastTs));
+    }
+  }
+  return [...map.entries()]
+    .map(([cwd, e]) => ({
+      cwd,
+      lastTs: e.lastTs,
+      users: [...e.users.entries()]
+        .map(([key, lastTs]) => ({ key, lastTs }))
+        .sort((a, b) => b.lastTs - a.lastTs),
+    }))
+    .sort((a, b) => b.lastTs - a.lastTs);
 }
 
 export interface TLine {

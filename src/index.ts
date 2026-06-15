@@ -1,12 +1,17 @@
 #!/usr/bin/env bun
-import { collectAll, dismissSession, type InstanceState } from "./collect.ts";
-import { render, recentCwds, waitingSessions, closeableSessions, cockpitTabs, type UIState } from "./render.ts";
+import { collectAll, dismissSession, instanceFolders, type InstanceState } from "./collect.ts";
+import {
+  render, recentCwds, waitingSessions, closeableSessions, cockpitTabs,
+  wizardFolders, wizardOrderedInstances, issueRepos, type UIState,
+} from "./render.ts";
 import { updateStates, type Transition } from "./tracker.ts";
 import { AgentRegistry } from "./agents.ts";
-import { INSTANCES, BUDGET_5H, BUDGET_WEEK, type InstanceDef } from "./instances.ts";
+import { BUDGET_5H, BUDGET_WEEK, type InstanceDef } from "./instances.ts";
+import { discoverInstances } from "./discover.ts";
 import { dirSuggestions, expandTilde, isDir } from "./paths.ts";
-import { refreshStatusline } from "./statusline.ts";
 import { readClipboardImage } from "./clipboard.ts";
+import { loadLocale, toggleLocale, t, stateLabel } from "./i18n.ts";
+import { pickFreeInstance, draftIssue, createIssue, splitDraft, isError } from "./issue.ts";
 
 /** Put the host terminal window into native macOS fullscreen (best-effort). */
 function enterFullscreen(): void {
@@ -31,10 +36,10 @@ function notifyTransitions(trans: Transition[]): void {
   let title: string;
   let body: string;
   if (waiting.length === 1) {
-    title = `${waiting[0].instance} · wartet`;
+    title = `${waiting[0].instance} · ${stateLabel("wartet")}`;
     body = waiting[0].title;
   } else {
-    title = `${waiting.length} Sessions warten`;
+    title = `${waiting.length} ${t("sessionsWaiting")}`;
     body = waiting.map((t) => t.title).slice(0, 4).join(" · ");
   }
   try {
@@ -57,7 +62,7 @@ function termWidth(): number {
 }
 
 async function runJson(): Promise<void> {
-  const states = collectAll();
+  const states = collectAll(discoverInstances());
   // strip noisy fields, keep the useful summary
   const out = states.map((s) => ({
     key: s.def.key,
@@ -82,46 +87,27 @@ async function runJson(): Promise<void> {
 
 function runOnce(): void {
   const now = Date.now();
-  const states = collectAll(now);
+  const states = collectAll(discoverInstances(), now);
   process.stdout.write(render(states, 0, now, termWidth(), undefined, process.stdout.rows || 40).join("\n") + "\n");
 }
 
 function runLoop(): void {
   let frame = 0;
-  let states: InstanceState[] = collectAll();
+  const instances = discoverInstances(); // resolved once at startup
+  let states: InstanceState[] = collectAll(instances);
   let lastRefresh = Date.now();
   updateStates(states, lastRefresh); // baseline — no flashes on startup
   const ui: UIState = {
     sel: 0, expanded: false, sessSel: 0, transcript: false, scroll: 0,
     cockpit: false, focus: "", input: "", cockpitArea: "input", listSel: 0, pendingImages: [],
-    picker: "", pickerInput: "", pickerSel: 0, pickerInstance: "", intake: false,
-    gridRegion: "cards", closeArm: "", renaming: "",
+    picker: "", pickerInput: "", pickerSel: 0, pickerInstance: "", pickerPane: "instance", pickerInstSel: 0,
+    pickerMode: "instance", gridRegion: "cards", closeArm: "", renaming: "",
+    issueStage: "pick", issuePane: "folder", issueFolderSel: 0, issueInput: "", issueFeedback: "",
+    issueDraft: "", issueScroll: 0, issueRepo: "", issueInstance: "", issueUrl: "", issueError: "",
   };
   const registry = new AgentRegistry();
+  let issueToken = 0; // bumped on each draft/create/open to ignore stale async results
 
-  /** Refresh the PAI statusline for the selected instance (self-throttled). */
-  const refreshSL = (): void => {
-    const s = states[ui.sel];
-    if (!s) return;
-    const ns = s.sessions[0];
-    const model = ns?.model ?? "";
-    const ctxTokens = ns?.ctxTokens ?? 0;
-    const base = /opus|sonnet/i.test(model) ? 1_000_000 : 200_000;
-    const ctxMax = Math.max(base, ctxTokens);
-    refreshStatusline(s.def.key, {
-      configDir: s.def.configDir,
-      cwd: ns?.cwd || process.env.HOME || ".",
-      model,
-      ctxTokens,
-      ctxMax,
-      ctxPct: ctxTokens ? (ctxTokens / ctxMax) * 100 : 0,
-      usage5hPct: Math.round((s.block5h.work / BUDGET_5H) * 100),
-      usage5hResetMs: s.reset5h,
-      usage7dPct: Math.round((s.week.work / BUDGET_WEEK) * 100),
-      usage7dResetMs: s.resetWk,
-      width: termWidth(),
-    });
-  };
 
   /** Default cwd for a new agent: the instance's most recent session, else $HOME. */
   const cwdFor = (def: InstanceDef): string => {
@@ -153,8 +139,90 @@ function runLoop(): void {
     ui.pickerSel = 0;
   };
 
+  /** Point the wizard's folder pane at the currently-highlighted instance. */
+  const syncWizardInstance = (): void => {
+    const def = states[Math.min(ui.pickerInstSel, states.length - 1)]?.def;
+    if (!def) return;
+    ui.pickerInstance = def.key;
+    ui.pickerInput = cwdFor(def);
+    ui.pickerSel = 0;
+  };
+
+  /** Open the new-agent wizard: centered popup, instance→folder by default. */
+  const openWizard = (): void => {
+    ui.picker = "wizard";
+    ui.pickerMode = "instance";
+    ui.pickerPane = "instance";
+    ui.pickerInstSel = ui.sel; // start on the currently-selected instance
+    ui.pickerSel = 0;
+    syncWizardInstance();
+  };
+
+  /** Open the quick-issue modal: pick a repo + describe, then draft on a free instance. */
+  const openIssue = (): void => {
+    issueToken++; // invalidate any in-flight draft/create from a previous run
+    ui.picker = "issue";
+    ui.issueStage = "pick";
+    ui.issuePane = "folder";
+    ui.issueFolderSel = 0;
+    ui.issueInput = "";
+    ui.issueFeedback = "";
+    ui.issueDraft = "";
+    ui.issueUrl = "";
+    ui.issueError = "";
+    ui.issueScroll = 0;
+  };
+
+  /** Draft (or redraft) the issue on the freest idle instance; async → review/error. */
+  const startDraft = (cwd: string, description: string, prior?: { draft: string; feedback: string }): void => {
+    const inst = pickFreeInstance(states, registry);
+    if (!inst) {
+      ui.issueStage = "error";
+      ui.issueError = t("noInstances");
+      return;
+    }
+    ui.issueRepo = cwd;
+    ui.issueInstance = inst.def.key;
+    ui.issueStage = "drafting";
+    ui.issueScroll = 0;
+    const token = ++issueToken;
+    void draftIssue(inst.def, cwd, description, prior).then((r) => {
+      if (token !== issueToken || ui.picker !== "issue") return; // superseded or closed
+      if (isError(r)) {
+        ui.issueStage = "error";
+        ui.issueError = r.error;
+      } else {
+        ui.issueDraft = r.raw;
+        ui.issueStage = "review";
+        ui.issueScroll = 0;
+      }
+    });
+  };
+
+  /** Create the reviewed issue via gh (deterministic, post-confirmation); async → done/error. */
+  const startCreate = (): void => {
+    const { title, body } = splitDraft(ui.issueDraft);
+    if (!title) {
+      ui.issueStage = "error";
+      ui.issueError = "draft had no title line";
+      return;
+    }
+    ui.issueStage = "creating";
+    const token = ++issueToken;
+    void createIssue(ui.issueRepo, title, body).then((r) => {
+      if (token !== issueToken || ui.picker !== "issue") return;
+      if (isError(r)) {
+        ui.issueStage = "error";
+        ui.issueError = r.error;
+      } else {
+        ui.issueUrl = r.url;
+        ui.issueStage = "done";
+      }
+    });
+  };
+
   const doRefresh = (t: number) => {
-    states = collectAll(t);
+    states = collectAll(instances, t);
     lastRefresh = t;
     notifyTransitions(updateStates(states, t));
   };
@@ -193,11 +261,18 @@ function runLoop(): void {
       const PGDN = k === "\x1b[6~";
       const page = Math.max(1, (process.stdout.rows || 40) - 8);
 
+      // No accounts discovered → only quit / rescan are meaningful (empty state).
+      if (states.length === 0) {
+        if (k === "q" || k === "\x03") return quit();
+        if (k === "r") doRefresh(Date.now());
+        return draw();
+      }
+
       // Working-folder picker: editable path + directory suggestions. Printable
       // keys edit the path, so this must run before the global quit letters.
       if (ui.picker === "cwd") {
         if (k === "\x03") return quit();
-        const def = INSTANCES.find((d) => d.key === ui.pickerInstance) ?? INSTANCES[0];
+        const def = instances.find((d) => d.key === ui.pickerInstance) ?? instances[0];
         const sugg = dirSuggestions(ui.pickerInput, recentCwds(states, ui.pickerInstance));
         if (ESC) {
           ui.picker = "";
@@ -230,33 +305,193 @@ function runLoop(): void {
         return draw();
       }
 
-      // Intake overview: PAI statusline + waiting sessions; digits = direct intake.
-      if (ui.intake) {
+      // New-agent wizard: centered popup with two orientations (^T toggles).
+      // Left pane = ui.pickerInstSel, right pane = ui.pickerSel; Tab/←/→ route.
+      if (ui.picker === "wizard") {
         if (k === "\x03") return quit();
         if (ESC) {
-          ui.intake = false;
-        } else if (UP) {
-          ui.sel = (ui.sel - 1 + n) % n;
-          refreshSL();
-        } else if (DOWN) {
-          ui.sel = (ui.sel + 1) % n;
-          refreshSL();
-        } else if (/^[1-9]$/.test(k)) {
-          const w = waitingSessions(states)[Number(k) - 1];
-          if (w) {
-            // re-enter the session (reuse existing agent, else take it over) → cockpit
-            ui.focus = `a:${enterSession(w.def, w.ss.sessionId, w.ss.cwd || process.env.HOME || ".", w.ss.pid)}`;
-            ui.intake = false;
-            ui.cockpit = true;
+          ui.picker = "";
+          return draw();
+        }
+        if (k === "\x14") {
+          // Ctrl-T: flip orientation (instance→folder ↔ folder→instance)
+          ui.pickerMode = ui.pickerMode === "folder" ? "instance" : "folder";
+          ui.pickerPane = "instance";
+          ui.pickerInstSel = 0;
+          ui.pickerSel = 0;
+          if (ui.pickerMode === "instance") syncWizardInstance();
+          return draw();
+        }
+        const folderMode = ui.pickerMode === "folder";
+
+        // LEFT pane (instances, or folders in folder-mode)
+        if (ui.pickerPane === "instance") {
+          const len = folderMode ? wizardFolders(states).length : states.length;
+          if (UP) {
+            ui.pickerInstSel = Math.max(0, ui.pickerInstSel - 1);
+            ui.pickerSel = 0;
+            if (!folderMode) syncWizardInstance();
+          } else if (DOWN) {
+            ui.pickerInstSel = Math.min(Math.max(0, len - 1), ui.pickerInstSel + 1);
+            ui.pickerSel = 0;
+            if (!folderMode) syncWizardInstance();
+          } else if (ENTER || RIGHT || k === "\t") {
+            ui.pickerPane = "cwd"; // into the right pane
+          } else {
+            return;
           }
-        } else if (k === "r") {
-          doRefresh(Date.now());
-          refreshSL();
+          return draw();
+        }
+
+        // RIGHT pane — folder-mode: pick the instance that runs in the folder
+        if (folderMode) {
+          const folders = wizardFolders(states);
+          const folder = folders[Math.min(Math.max(0, ui.pickerInstSel), Math.max(0, folders.length - 1))];
+          const ordered = wizardOrderedInstances(states, folder);
+          if (ENTER) {
+            const inst = ordered[Math.min(Math.max(0, ui.pickerSel), Math.max(0, ordered.length - 1))];
+            if (inst && folder && isDir(folder.cwd)) {
+              ui.focus = `a:${registry.launch(inst.def, folder.cwd).launchId}`;
+              ui.picker = "";
+              ui.cockpit = true;
+            }
+          } else if (k === "\t" || LEFT) {
+            ui.pickerPane = "instance";
+          } else if (UP) {
+            ui.pickerSel = Math.max(0, ui.pickerSel - 1);
+          } else if (DOWN) {
+            ui.pickerSel = Math.min(Math.max(0, ordered.length - 1), ui.pickerSel + 1);
+          } else {
+            return;
+          }
+          return draw();
+        }
+
+        // RIGHT pane — instance-mode: editable folder path + history suggestions
+        const def = instances.find((d) => d.key === ui.pickerInstance) ?? instances[0];
+        const history = def
+          ? [...new Set([...recentCwds(states, def.key), ...instanceFolders(def.configDir).map((f) => f.cwd)])]
+          : recentCwds(states, ui.pickerInstance);
+        const sugg = dirSuggestions(ui.pickerInput, history, 60);
+        if (ENTER) {
+          const cwd = expandTilde(ui.pickerInput);
+          if (isDir(cwd)) {
+            ui.focus = `a:${registry.launch(def, cwd).launchId}`;
+            ui.picker = "";
+            ui.cockpit = true;
+          } // invalid path: stay (shown red)
+        } else if (k === "\t" || LEFT) {
+          ui.pickerPane = "instance";
+        } else if (UP) {
+          ui.pickerSel = Math.max(0, ui.pickerSel - 1);
+        } else if (DOWN) {
+          ui.pickerSel = Math.min(Math.max(0, sugg.length - 1), ui.pickerSel + 1);
+        } else if (RIGHT) {
+          const pick = sugg[Math.min(ui.pickerSel, sugg.length - 1)];
+          if (pick) {
+            ui.pickerInput = pick.endsWith("/") ? pick : pick + "/";
+            ui.pickerSel = 0;
+          }
+        } else if (k === "\x7f" || k === "\b") {
+          ui.pickerInput = ui.pickerInput.slice(0, -1);
+          ui.pickerSel = 0;
+        } else if (k.length > 0 && ![...k].some((c) => c.charCodeAt(0) < 0x20)) {
+          ui.pickerInput += k;
+          ui.pickerSel = 0;
         } else {
           return;
         }
         return draw();
       }
+
+      // Quick-issue modal: pick → draft → review → create, a small stage machine.
+      if (ui.picker === "issue") {
+        if (k === "\x03") return quit();
+
+        // Async stages: only cancel is meaningful while the instance / gh runs.
+        if (ui.issueStage === "drafting" || ui.issueStage === "creating") {
+          if (ESC) {
+            issueToken++; // abandon the in-flight result
+            ui.picker = "";
+          }
+          return draw();
+        }
+
+        if (ui.issueStage === "pick") {
+          const folders = issueRepos(states);
+          if (ESC) {
+            ui.picker = "";
+          } else if (k === "\t") {
+            ui.issuePane = ui.issuePane === "folder" ? "desc" : "folder";
+          } else if (ui.issuePane === "folder") {
+            if (UP) ui.issueFolderSel = Math.max(0, ui.issueFolderSel - 1);
+            else if (DOWN) ui.issueFolderSel = Math.min(Math.max(0, folders.length - 1), ui.issueFolderSel + 1);
+            else if (RIGHT || ENTER) ui.issuePane = "desc";
+            else return;
+          } else {
+            // description pane: editable text; ← jumps back to the repo list
+            if (LEFT) {
+              ui.issuePane = "folder";
+            } else if (ENTER) {
+              const folder = folders[Math.min(ui.issueFolderSel, Math.max(0, folders.length - 1))];
+              if (folder && ui.issueInput.trim()) startDraft(folder.cwd, ui.issueInput.trim());
+            } else if (k === "\x7f" || k === "\b") {
+              ui.issueInput = ui.issueInput.slice(0, -1);
+            } else if (k.length > 0 && ![...k].some((c) => c.charCodeAt(0) < 0x20)) {
+              ui.issueInput += k;
+            } else {
+              return;
+            }
+          }
+          return draw();
+        }
+
+        if (ui.issueStage === "review") {
+          if (ESC) ui.picker = "";
+          else if (ENTER) startCreate();
+          else if (k === "r" || k === "R") { ui.issueStage = "rewrite"; ui.issueFeedback = ""; }
+          else if (UP) ui.issueScroll = Math.max(0, ui.issueScroll - 1);
+          else if (DOWN) ui.issueScroll += 1; // clamped in render
+          else if (PGUP) ui.issueScroll = Math.max(0, ui.issueScroll - page);
+          else if (PGDN) ui.issueScroll += page;
+          else return;
+          return draw();
+        }
+
+        if (ui.issueStage === "rewrite") {
+          if (ESC) {
+            ui.issueStage = "review";
+          } else if (ENTER) {
+            if (ui.issueFeedback.trim()) {
+              startDraft(ui.issueRepo, ui.issueInput.trim(), { draft: ui.issueDraft, feedback: ui.issueFeedback.trim() });
+            }
+          } else if (k === "\x7f" || k === "\b") {
+            ui.issueFeedback = ui.issueFeedback.slice(0, -1);
+          } else if (k.length > 0 && ![...k].some((c) => c.charCodeAt(0) < 0x20)) {
+            ui.issueFeedback += k;
+          } else {
+            return;
+          }
+          return draw();
+        }
+
+        if (ui.issueStage === "done") {
+          if (ESC || ENTER) ui.picker = "";
+          return draw();
+        }
+
+        // error stage: r retries the draft, Esc closes
+        if (k === "r" || k === "R") {
+          if (ui.issueRepo && ui.issueInput.trim()) startDraft(ui.issueRepo, ui.issueInput.trim());
+          else ui.issueStage = "pick";
+        } else if (ESC) {
+          ui.picker = "";
+        } else {
+          return;
+        }
+        return draw();
+      }
+
 
       // Cockpit: input-bar mode. Printable keys type into ui.input, so the
       // global quit/refresh letters below must NOT fire here.
@@ -330,7 +565,7 @@ function runLoop(): void {
         } else if (k === "\x0e") {
           // Ctrl-N: pick a working folder, then launch a fresh agent
           const key = focus?.kind === "agent" ? focus.agent.opts.instanceKey : focus?.def?.key;
-          const def = INSTANCES.find((d) => d.key === key) ?? INSTANCES[ui.sel] ?? INSTANCES[0];
+          const def = instances.find((d) => d.key === key) ?? instances[ui.sel] ?? instances[0];
           openPicker(def);
         } else if (k === "\x12") {
           // Ctrl-R: restart focused agent (picks up new plugins/MCP, keeps convo)
@@ -367,6 +602,7 @@ function runLoop(): void {
       }
 
       if (k === "q" || k === "\x03") return quit(); // q / Ctrl-C
+      if (k === "L") { toggleLocale(); return draw(); } // flip DE ↔ EN (persisted)
 
       if (ui.transcript) {
         if (UP) ui.scroll += 1; // older
@@ -451,13 +687,14 @@ function runLoop(): void {
         } else if (k === "c") {
           ui.cockpit = true; // open the agent cockpit
           ui.cockpitArea = "input";
-        } else if (k === "p") {
-          ui.intake = true; // PAI statusline + waiting-session intake
-          refreshSL();
         } else if (k === "n") {
-          openPicker(states[ui.sel].def);
+          openWizard(); // 2-pane modal: instance (with load) | working-folder
+        } else if (k === "i") {
+          openIssue(); // quick-issue: pick repo + describe → draft on a free instance
+        } else if (k === "N") {
+          openPicker(states[ui.sel].def); // quick-launch on the selected instance
         } else if (k === "A") {
-          const started = registry.startAll(INSTANCES, cwdFor);
+          const started = registry.startAll(instances, cwdFor);
           const f = started[0] ?? registry.list()[0];
           if (f) ui.focus = `a:${f.launchId}`;
           ui.cockpit = true;
@@ -475,7 +712,6 @@ function runLoop(): void {
   const draw = () => {
     const now = Date.now();
     if (now - lastRefresh >= REFRESH_MS) doRefresh(now);
-    if (ui.intake) refreshSL(); // self-throttled; keeps the statusline fresh
     const w = termWidth();
     const h = process.stdout.rows || 0;
     let prefix = "\x1b[H";
@@ -494,6 +730,8 @@ function runLoop(): void {
   const timer = setInterval(draw, FRAME_MS);
   draw();
 }
+
+loadLocale(); // resolve locale once: CD_LANG env > persisted config > $LANG detect
 
 if (args.has("--json")) {
   await runJson();
