@@ -345,11 +345,16 @@ export function waitingSessions(states: InstanceState[]): WaitingSession[] {
  * existing agent via dedup.
  */
 export function closeableSessions(states: InstanceState[]): WaitingSession[] {
-  return states
-    .flatMap((s) =>
-      s.sessions.filter((ss) => ss.state === "wartet" || ss.state === "stale").map((ss) => ({ def: s.def, ss })))
-    .sort((a, b) =>
-      a.ss.state === b.ss.state ? b.ss.lastTs - a.ss.lastTs : a.ss.state === "wartet" ? -1 : 1);
+  const list = states.flatMap((s) =>
+    s.sessions.filter((ss) => ss.state === "wartet" || ss.state === "stale").map((ss) => ({ def: s.def, ss })));
+  const key = (w: WaitingSession) => repoSlug(w.ss.cwd) || dirName(w.ss.cwd);
+  const groupTs = new Map<string, number>();
+  for (const w of list) groupTs.set(key(w), Math.max(groupTs.get(key(w)) ?? 0, w.ss.lastTs));
+  return list.sort((a, b) => {
+    const ka = key(a), kb = key(b);
+    if (ka !== kb) return (groupTs.get(kb)! - groupTs.get(ka)!) || ka.localeCompare(kb);
+    return b.ss.lastTs - a.ss.lastTs;
+  });
 }
 
 /** Live tail (last 5 lines) of each actively-working session, below the grid.
@@ -453,21 +458,34 @@ function renderGrid(
   }
   if (!qs.length) out.push(`  ${DIM}${t("noSessions")}${RESET}`);
   const TW = 22; // title column width
-  const RW = 20; // repo column width
   const WTW = 18; // worktree column width
-  const MSGW = 48; // last-message column width
   if (qs.length) {
-    // header aligned with the marker(1)+space prefix
-    out.push(`  ${DIM}${pad("INST", 4)} ${pad("STATE", 7)} ${pad(t("colTitle"), TW)} ${pad("REPO", RW)} ${pad("WORKTREE", WTW)} ${t("colLast")}${RESET}`);
+    out.push(`  ${DIM}${pad("INST", 4)} ${pad("STATE", 7)} ${pad(t("colTitle"), TW)} ${pad("WORKTREE", WTW)} ${t("colLast")}${RESET}`);
   }
   const lsel = Math.min(Math.max(0, ui.listSel), Math.max(0, qs.length - 1));
-  // autoscale: show as many rows as fit the terminal (reserve ↑/↓ + blank + legend + hints)
+  // group the closeable sessions by repo: a header per repo, sessions underneath
+  const repoKeyOf = (w: WaitingSession) => repoSlug(w.ss.cwd) || dirName(w.ss.cwd);
+  const grpCount = new Map<string, number>();
+  for (const w of qs) grpCount.set(repoKeyOf(w), (grpCount.get(repoKeyOf(w)) ?? 0) + 1);
+  const disp: { header?: string; count?: number; w?: WaitingSession; i?: number }[] = [];
+  let prevKey = "";
+  qs.forEach((w, i) => {
+    const k = repoKeyOf(w);
+    if (k !== prevKey) { disp.push({ header: k, count: grpCount.get(k) }); prevKey = k; }
+    disp.push({ w, i });
+  });
   const qMax = Math.max(3, height - out.length - 5);
-  // window the list so the selection stays visible when it overflows
-  const start = Math.min(Math.max(0, lsel - qMax + 1), Math.max(0, qs.length - qMax));
-  if (start > 0) out.push(`  ${DIM}↑ ${start} ${t("further")}${RESET}`);
-  qs.slice(start, start + qMax).forEach((w, idx) => {
-    const i = start + idx;
+  const selDisp = Math.max(0, disp.findIndex((d) => d.i === lsel));
+  const startD = Math.min(Math.max(0, selDisp - Math.floor(qMax / 2)), Math.max(0, disp.length - qMax));
+  const view = disp.slice(startD, startD + qMax);
+  const hiddenAbove = disp.slice(0, startD).filter((d) => d.w).length;
+  if (hiddenAbove > 0) out.push(`  ${DIM}↑ ${hiddenAbove} ${t("further")}${RESET}`);
+  view.forEach((d) => {
+    if (d.header !== undefined) {
+      out.push(`  ${fg(74)}📦 ${d.header}${RESET} ${DIM}(${d.count})${RESET}`);
+      return;
+    }
+    const w = d.w!, i = d.i!;
     const sel = qFocus && i === lsel;
     const armed = ui.closeArm === w.ss.sessionId;
     const open = !!registry?.forSession(w.ss.sessionId);
@@ -477,16 +495,13 @@ function renderGrid(
     const stateTag = open ? `${fg(46)}${pad(`✎ ${t("open")}`, 7)}${RESET}` : `${fg(v.color)}${pad(stateLabel(w.ss.state), 7)}${RESET}`;
     const titleRaw = registry?.nameOverride(w.ss.sessionId) ?? (w.ss.title || "~" + dirName(w.ss.cwd));
     const title = pad(`${sel ? `${BOLD}${fg(231)}` : fg(252)}${titleRaw}${RESET}`, TW);
-    const { repo, worktree } = repoParts(w.ss.cwd);
-    const repoCol = `${DIM}${pad(repo || pathCol(w.ss.cwd, RW), RW)}${RESET}`;
-    const wtCol = `${fg(108)}${pad(worktree, WTW)}${RESET}`;
+    const wtCol = `${fg(108)}${pad(repoParts(w.ss.cwd).worktree, WTW)}${RESET}`;
     const last = (w.ss.activity || "").replace(/\s+/g, " ");
-    const msg = armed
-      ? `${fg(196)}${t("closeConfirm")}${RESET}`
-      : `${DIM}${trunc(last, MSGW)}${RESET}`;
-    out.push(trunc(`${marker} ${inst} ${stateTag} ${title} ${repoCol} ${wtCol} ${msg}`, W));
+    const msg = armed ? `${fg(196)}${t("closeConfirm")}${RESET}` : `${DIM}${last}${RESET}`;
+    out.push(trunc(`${marker} ${inst} ${stateTag} ${title} ${wtCol} ${msg}`, W));
   });
-  const below = qs.length - (start + Math.min(qMax, qs.length - start));
+  const shown = view.filter((d) => d.w).length;
+  const below = qs.length - hiddenAbove - shown;
   if (below > 0) out.push(`  ${DIM}↓ ${below} ${t("further")}${RESET}`);
 
   out.push("");
