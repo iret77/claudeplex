@@ -476,10 +476,15 @@ function renderGrid(
     out.push(`  ${fg(213)}✎ ${t("renameLabel")}${RESET} ${ui.input}${caret}   ${DIM}${t("saveCancel")}${RESET}`);
   }
   if (!qs.length) out.push(`  ${DIM}${t("noSessions")}${RESET}`);
-  const TW = 30; // title column width
-  const WTW = 24; // worktree column width
+  // auto-size title + worktree to content; add an HH:MM time column; rest → message
+  const clock = (ms: number) => { const d = new Date(ms); const p = (n: number) => String(n).padStart(2, "0"); return `${p(d.getHours())}:${p(d.getMinutes())}`; };
+  const titleOf = (w: WaitingSession) => registry?.nameOverride(w.ss.sessionId) ?? (w.ss.title || "~" + dirName(w.ss.cwd));
+  const TW = qs.length ? Math.min(40, Math.max(vwidth(t("colTitle")), ...qs.map((w) => vwidth(titleOf(w))))) : vwidth(t("colTitle"));
+  const WTW = qs.length ? Math.min(26, Math.max(0, ...qs.map((w) => vwidth(repoParts(w.ss.cwd).worktree)))) : 0;
+  const CW = 5; // HH:MM
   if (qs.length) {
-    out.push(`  ${DIM}${pad("INST", 4)} ${pad("STATE", 7)} ${pad(t("colTitle"), TW)} ${pad("WORKTREE", WTW)} ${t("colLast")}${RESET}`);
+    const wtHdr = WTW > 0 ? ` ${pad("WORKTREE", WTW)}` : "";
+    out.push(`  ${DIM}${pad("INST", 4)} ${pad("STATE", 7)} ${pad(t("colTitle"), TW)}${wtHdr} ${pad("TIME", CW)} ${t("colLast")}${RESET}`);
   }
   const lsel = Math.min(Math.max(0, ui.listSel), Math.max(0, qs.length - 1));
   // group the closeable sessions by repo: a header per repo, sessions underneath
@@ -515,10 +520,11 @@ function renderGrid(
     const stateTag = open ? `${fg(46)}${pad(`✎ ${t("open")}`, 7)}${RESET}` : `${fg(v.color)}${pad(stateLabel(w.ss.state), 7)}${RESET}`;
     const titleRaw = registry?.nameOverride(w.ss.sessionId) ?? (w.ss.title || "~" + dirName(w.ss.cwd));
     const title = pad(`${sel ? `${BOLD}${fg(231)}` : fg(252)}${titleRaw}${RESET}`, TW);
-    const wtCol = `${fg(108)}${pad(repoParts(w.ss.cwd).worktree, WTW)}${RESET}`;
+    const wtCol = WTW > 0 ? ` ${fg(108)}${pad(repoParts(w.ss.cwd).worktree, WTW)}${RESET}` : "";
+    const timeCol = `${DIM}${pad(clock(w.ss.lastTs), CW)}${RESET}`;
     const last = (w.ss.activity || "").replace(/\s+/g, " ");
     const msg = armed ? `${fg(196)}${t("closeConfirm")}${RESET}` : `${DIM}${last}${RESET}`;
-    out.push(trunc(`${marker} ${inst} ${stateTag} ${title} ${wtCol} ${msg}`, W));
+    out.push(trunc(`${marker} ${inst} ${stateTag} ${title}${wtCol} ${timeCol} ${msg}`, W));
   });
   const shown = view.filter((d) => d.w).length;
   const below = qs.length - hiddenAbove - shown;
