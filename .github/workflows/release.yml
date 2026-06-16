@@ -55,7 +55,7 @@ jobs:
           ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
           VERSION="${GITHUB_REF_NAME#v}"
           bun run scripts/formula.ts "$VERSION" dist/SHA256SUMS.txt > formula.rb
-          git clone git@github.com:byte5ai/homebrew-tap.git tap
+          git clone git@github.com:iret77/homebrew-tap.git tap
           mkdir -p tap/Formula
           cp formula.rb tap/Formula/claudeplex.rb
           cd tap

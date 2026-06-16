@@ -3,7 +3,7 @@
  * Render the Homebrew formula for a release from its SHA256SUMS file.
  *   bun run scripts/formula.ts <version> <path/to/SHA256SUMS.txt>
  * Emits Formula/claudeplex.rb on stdout. Used by the release workflow to bump
- * the byte5ai/homebrew-tap formula automatically.
+ * the iret77/homebrew-tap formula automatically.
  */
 const [version, sumsPath] = process.argv.slice(2);
 if (!version || !sumsPath) {
@@ -23,11 +23,11 @@ const sha = (target: string): string => {
   return s;
 };
 const url = (target: string): string =>
-  `https://github.com/byte5ai/claudeplex/releases/download/v${version}/claudeplex-${target}`;
+  `https://github.com/iret77/claudeplex/releases/download/v${version}/claudeplex-${target}`;
 
 process.stdout.write(`class Claudeplex < Formula
   desc "Terminal multiplexer and cockpit for Claude Code"
-  homepage "https://github.com/byte5ai/claudeplex"
+  homepage "https://github.com/iret77/claudeplex"
   version "${version}"
   license "MIT"
 

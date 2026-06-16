@@ -2,10 +2,10 @@
 # Claudeplex installer — downloads the standalone binary for your platform from
 # the latest GitHub Release. No Bun/Node required.
 #
-#   curl -fsSL https://raw.githubusercontent.com/byte5ai/claudeplex/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/iret77/claudeplex/main/install.sh | sh
 set -e
 
-REPO="byte5ai/claudeplex"
+REPO="iret77/claudeplex"
 BIN="claudeplex"
 
 os="$(uname -s)"

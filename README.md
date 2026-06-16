@@ -54,13 +54,13 @@ your machine — see [Security &amp; privacy](#security--privacy).
 ### Homebrew (macOS)
 
 ```bash
-brew install byte5ai/tap/claudeplex
+brew install iret77/tap/claudeplex
 ```
 
 ### Install script (macOS / Linux)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/byte5ai/claudeplex/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/iret77/claudeplex/main/install.sh | sh
 ```
 
 Downloads the standalone binary for your OS/arch from the latest GitHub Release into
@@ -69,7 +69,7 @@ Downloads the standalone binary for your OS/arch from the latest GitHub Release 
 ### From source
 
 ```bash
-git clone https://github.com/byte5ai/claudeplex.git
+git clone https://github.com/iret77/claudeplex.git
 cd claudeplex
 bun install
 bun start
