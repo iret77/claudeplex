@@ -214,6 +214,30 @@ const de: Catalog = {
   issueCreated: "Issue angelegt",
   issueErr: "Issue konnte nicht angelegt werden",
   issueRetry: "erneut",
+  // theme picker
+  themeTitle: "Theme",
+  themeHint: "↑/↓ Vorschau · ⏎ übernehmen · Esc abbrechen",
+  // commander
+  cmdNetwork: "Netzwerk",
+  cmdHosts: "Hosts",
+  cmdFiles: "Dateien",
+  cmdEnterHost: "Host öffnen",
+  cmdLoading: "lädt …",
+  cmdOpenDir: "Ordner öffnen",
+  cmdUp: "hoch",
+  cmdShell: "Shell",
+  cmdLaunchRc: "RC-Server",
+  cmdHostsBack: "Hosts",
+  cmdMark: "merken",
+  cmdPaste: "einfügen",
+  cmdCopying: "kopiere …",
+  cmdLaunching: "starte RC-Server …",
+  cmdKill: "stoppen",
+  cmdAttach: "verbinden",
+  cmdTwoPane: "zwei Panes · Tab wechselt · c kopiert",
+  cmdPickHost: "Host wählen",
+  cmdSwitch: "Pane",
+  cmdCopy: "kopieren",
 };
 
 const en: Catalog = {
@@ -335,6 +359,30 @@ const en: Catalog = {
   issueCreated: "Issue created",
   issueErr: "Issue creation failed",
   issueRetry: "retry",
+  // theme picker
+  themeTitle: "Theme",
+  themeHint: "↑/↓ preview · ⏎ apply · Esc cancel",
+  // commander
+  cmdNetwork: "network",
+  cmdHosts: "Hosts",
+  cmdFiles: "Files",
+  cmdEnterHost: "open host",
+  cmdLoading: "loading …",
+  cmdOpenDir: "open dir",
+  cmdUp: "up",
+  cmdShell: "shell",
+  cmdLaunchRc: "RC server",
+  cmdHostsBack: "hosts",
+  cmdMark: "mark",
+  cmdPaste: "paste",
+  cmdCopying: "copying …",
+  cmdLaunching: "launching RC server …",
+  cmdKill: "stop",
+  cmdAttach: "attach",
+  cmdTwoPane: "two panes · Tab switches · c copies",
+  cmdPickHost: "pick host",
+  cmdSwitch: "pane",
+  cmdCopy: "copy",
 };
 
 const catalogs: Record<Locale, Catalog> = { de, en };

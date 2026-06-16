@@ -17,11 +17,25 @@ import { getRunningConfigDirs } from "./collect.ts";
 
 const HOME = homedir();
 
-/** Accent palette — extends the original hand-picked instance colors. */
-const PALETTE = [81, 213, 156, 215, 117, 222, 175, 114, 209, 147];
+/**
+ * Instances are no longer tinted with a per-instance rainbow — under the Lumen
+ * theme they're told apart by key/label and their position in a neutral grey
+ * ramp (see theme.ts `instanceShade`). The `color` field is kept for the
+ * overrides file but defaults to 0 (unused by the renderer).
+ */
+const NO_COLOR = 0;
 
 /** Config-dir names that look like ours but are NOT real accounts. */
 const EXCLUDE = /(?:^|[.-])(?:mem|backup|backups|bak|old|tmp|temp|observer)$/i;
+
+/** The default account: data in ~/.claude, but oauthAccount in ~/.claude.json (HOME). */
+const DEFAULT_DIR = join(HOME, ".claude");
+const HOME_ACCOUNT = join(HOME, ".claude.json");
+
+/** Where a config dir's oauthAccount lives. */
+function accountFileFor(dir: string): string {
+  return dir === DEFAULT_DIR && existsSync(HOME_ACCOUNT) ? HOME_ACCOUNT : join(dir, ".claude.json");
+}
 
 export interface InstanceOverride {
   /** absolute config dir this override applies to */
@@ -36,7 +50,7 @@ export interface InstanceOverride {
 /** True if the config dir holds its own OAuth login (a real, distinct account). */
 function hasAccount(dir: string): boolean {
   try {
-    return !!JSON.parse(readFileSync(join(dir, ".claude.json"), "utf8")).oauthAccount;
+    return !!JSON.parse(readFileSync(accountFileFor(dir), "utf8")).oauthAccount;
   } catch {
     return false;
   }
@@ -73,7 +87,7 @@ function shortLabel(s: string): string {
  */
 function accountLabel(dir: string): string {
   try {
-    const o = JSON.parse(readFileSync(join(dir, ".claude.json"), "utf8"));
+    const o = JSON.parse(readFileSync(accountFileFor(dir), "utf8"));
     const acc = o.oauthAccount ?? {};
     const org: string = acc.organizationName ?? "";
     const email: string = acc.emailAddress ?? acc.email ?? "";
@@ -147,11 +161,14 @@ export function discoverInstances(): InstanceDef[] {
     if (ov?.hide) continue;
     const base = dir.split("/").pop() ?? dir;
     const label = ov?.label || accountLabel(dir) || suffixLabel(base);
+    const accountFile = accountFileFor(dir);
     defs.push({
       key: ov?.key || `c${i + 1}`,
       label,
-      color: ov?.color ?? PALETTE[i % PALETTE.length],
+      color: ov?.color ?? NO_COLOR,
       configDir: dir,
+      accountFile,
+      isDefault: dir === DEFAULT_DIR && accountFile === HOME_ACCOUNT,
     });
     i++;
   }

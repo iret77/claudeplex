@@ -6,12 +6,14 @@
  *
  * Output is an array of styled, width-bounded lines. Pure module.
  */
-import { RESET, BOLD, DIM, ITAL, fg, vwidth, pad, trunc } from "./ui.ts";
+import { RESET, BOLD, DIM, ITAL, tfg, vwidth, pad, trunc } from "./ui.ts";
+import { getTheme } from "./theme.ts";
 
-const CODE = 180; // inline code / fences
-const H = 81; // headings
-const RULE = 240;
-const BULLET = 250;
+// Markdown accents resolve against the live theme so transcripts match the UI.
+const CODE = () => tfg(getTheme().accentHi); // inline code / fences
+const H = () => tfg(getTheme().accent); // headings / links
+const RULE = () => tfg(getTheme().textDim); // rules, quote gutters, table borders
+const BULLET = () => tfg(getTheme().text3);
 
 /** Apply inline styling. Code spans are protected first so their content is raw. */
 export function inline(s: string): string {
@@ -24,8 +26,8 @@ export function inline(s: string): string {
     .replace(/\*\*([^*]+)\*\*/g, (_m, b) => `${BOLD}${b}${RESET}`)
     .replace(/__([^_]+)__/g, (_m, b) => `${BOLD}${b}${RESET}`)
     .replace(/(^|[^*])\*([^*\n]+)\*/g, (_m, p, i) => `${p}${ITAL}${i}${RESET}`)
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, (_m, txt) => `${fg(H)}${txt}${RESET}`);
-  t = t.replace(/\x00(\d+)\x00/g, (_m, n) => `${fg(CODE)}${codes[Number(n)]}${RESET}`);
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, (_m, txt) => `${H()}${txt}${RESET}`);
+  t = t.replace(/\x00(\d+)\x00/g, (_m, n) => `${CODE()}${codes[Number(n)]}${RESET}`);
   return t;
 }
 
@@ -74,7 +76,7 @@ function renderTable(rows: string[][], width: number): string[] {
     widths[i]--;
     total--;
   }
-  const C = (ch: string) => `${fg(RULE)}${ch}${RESET}`;
+  const C = (ch: string) => `${RULE()}${ch}${RESET}`;
   const bar = (l: string, m: string, r: string) =>
     C(l) + widths.map((w) => C("-".repeat(w + 2))).join(C(m)) + C(r);
   const hline = (l: string, m: string, r: string) =>
@@ -106,7 +108,7 @@ export function renderMarkdown(md: string, width: number): string[] {
     if (/^```/.test(t)) {
       i++;
       while (i < src.length && !/^```/.test(src[i].trim())) {
-        out.push(`${fg(RULE)}▏${RESET} ${fg(CODE)}${trunc(src[i].replace(/\t/g, "  "), W - 2)}${RESET}`);
+        out.push(`${RULE()}▏${RESET} ${CODE()}${trunc(src[i].replace(/\t/g, "  "), W - 2)}${RESET}`);
         i++;
       }
       continue;
@@ -129,20 +131,20 @@ export function renderMarkdown(md: string, width: number): string[] {
     const h = t.match(/^(#{1,6})\s+(.*)$/);
     if (h) {
       const lvl = h[1].length;
-      out.push(`${fg(H)}${BOLD}${lvl <= 2 ? "▍ " : ""}${inline(h[2])}${RESET}`);
+      out.push(`${H()}${BOLD}${lvl <= 2 ? "▍ " : ""}${inline(h[2])}${RESET}`);
       continue;
     }
 
     // horizontal rule
     if (/^(-{3,}|\*{3,}|_{3,})$/.test(t)) {
-      out.push(`${fg(RULE)}${"─".repeat(W)}${RESET}`);
+      out.push(`${RULE()}${"─".repeat(W)}${RESET}`);
       continue;
     }
 
     // block quote
     const q = line.match(/^\s*>\s?(.*)$/);
     if (q) {
-      for (const wl of wrapRaw(q[1], W - 2)) out.push(`${fg(RULE)}▎${RESET} ${DIM}${inline(wl)}${RESET}`);
+      for (const wl of wrapRaw(q[1], W - 2)) out.push(`${RULE()}▎${RESET} ${DIM}${inline(wl)}${RESET}`);
       continue;
     }
 
@@ -150,7 +152,7 @@ export function renderMarkdown(md: string, width: number): string[] {
     const b = line.match(/^(\s*)([-*+]|\d+\.)\s+(.*)$/);
     if (b) {
       const indent = b[1].length;
-      const marker = /\d/.test(b[2]) ? `${fg(BULLET)}${b[2]}${RESET}` : `${fg(BULLET)}•${RESET}`;
+      const marker = /\d/.test(b[2]) ? `${BULLET()}${b[2]}${RESET}` : `${BULLET()}•${RESET}`;
       const wrapped = wrapRaw(b[3], W - indent - 3);
       wrapped.forEach((wl, k) => {
         const lead = k === 0 ? `${" ".repeat(indent)}${marker} ` : `${" ".repeat(indent + 2)}`;

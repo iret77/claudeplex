@@ -12,6 +12,7 @@
  */
 import { join } from "node:path";
 import { userLine, parseEvent, type ParsedEvent } from "./stream.ts";
+import { ICONS } from "./ui.ts";
 
 export type AgentState = "starting" | "ready" | "busy" | "dead";
 
@@ -33,6 +34,8 @@ export interface AgentOpts {
   name?: string;
   /** instance key, for labelling */
   instanceKey: string;
+  /** default account → spawn with CLAUDE_CONFIG_DIR unset (don't override the login) */
+  isDefault?: boolean;
 }
 
 const MAX_LINES = 2000;
@@ -87,7 +90,10 @@ export class ManagedAgent {
     delete env.ANTHROPIC_API_KEY; // force subscription OAuth, not an API key
     delete env.CLAUDECODE; // don't look like a nested claude session
     delete env.CLAUDE_CODE_ENTRYPOINT;
-    env.CLAUDE_CONFIG_DIR = this.opts.configDir; // the correct login
+    // the default account lives at ~/.claude.json (CLAUDE_CONFIG_DIR unset);
+    // setting it to ~/.claude would make claude lose that login.
+    if (this.opts.isDefault) delete env.CLAUDE_CONFIG_DIR;
+    else env.CLAUDE_CONFIG_DIR = this.opts.configDir;
     return env;
   }
 
@@ -233,7 +239,7 @@ export class ManagedAgent {
   send(text: string, images?: { mediaType: string; data: string }[]): boolean {
     const t = text.trim();
     if ((!t && !images?.length) || !this.sink || this.state === "dead") return false;
-    this.commit("user", t + (images?.length ? ` ${"📎".repeat(images.length)}` : ""));
+    this.commit("user", t + (images?.length ? ` ${ICONS.attach.repeat(images.length)}` : ""));
     this.state = "busy";
     try {
       this.sink.write(userLine(t, images));

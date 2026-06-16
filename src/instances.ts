@@ -14,10 +14,22 @@ export interface InstanceDef {
   key: string;
   /** short human label shown in the UI */
   label: string;
-  /** accent color (256-color code) */
+  /** accent color (256-color code; unused under the Lumen grey ramp) */
   color: number;
-  /** absolute path to CLAUDE_CONFIG_DIR */
+  /** data dir (sessions/projects) — for the default account this is ~/.claude */
   configDir: string;
+  /**
+   * Path to the .claude.json holding the oauthAccount. Usually
+   * <configDir>/.claude.json, but the DEFAULT account keeps it at ~/.claude.json
+   * (in $HOME) while its data lives in ~/.claude.
+   */
+  accountFile?: string;
+  /**
+   * The default account (no CLAUDE_CONFIG_DIR). Spawns must NOT set
+   * CLAUDE_CONFIG_DIR — setting it to ~/.claude makes claude look for
+   * ~/.claude/.claude.json (absent) and lose the login.
+   */
+  isDefault?: boolean;
 }
 
 export const INSTANCES: InstanceDef[] = [];

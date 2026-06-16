@@ -1,5 +1,6 @@
-import { readdirSync, statSync, readFileSync, openSync, readSync, closeSync } from "node:fs";
+import { readdirSync, statSync, readFileSync, openSync, readSync, closeSync, readlinkSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import type { InstanceDef } from "./instances.ts";
 import {
   blockResetAt,
@@ -294,6 +295,168 @@ export function getRunningConfigDirs(): Map<string, number> {
   return map;
 }
 
+/* ── Remote-control fleet observation (component B) ───────────────────────────
+ * We never poke the research-preview server's internals; we only OBSERVE the OS:
+ * one `ps` snapshot for the process tree, /proc/<pid>/smaps_rollup for accurate
+ * (shared-aware) memory, /proc/<pid>/cwd for the working dir, and the existing
+ * session registry for the live sessions a server is hosting. */
+
+/** A process from a single `ps` snapshot. */
+export interface Proc {
+  pid: number;
+  ppid: number;
+  rssKb: number;
+  command: string;
+}
+
+/** One `ps` call → pid → {ppid, rssKb, command}. Empty map if ps is unavailable. */
+export function psSnapshot(): Map<number, Proc> {
+  const map = new Map<number, Proc>();
+  try {
+    const out = Bun.spawnSync(["ps", "-eww", "-o", "pid=,ppid=,rss=,command="]).stdout.toString();
+    for (const line of out.split("\n")) {
+      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/);
+      if (m) map.set(Number(m[1]), { pid: Number(m[1]), ppid: Number(m[2]), rssKb: Number(m[3]), command: m[4] });
+    }
+  } catch {
+    /* ps unavailable */
+  }
+  return map;
+}
+
+/** All descendant pids of `root` (inclusive), walked over the ppid tree. */
+export function descendants(root: number, procs: Map<number, Proc>): number[] {
+  const kids = new Map<number, number[]>();
+  for (const p of procs.values()) (kids.get(p.ppid) ?? kids.set(p.ppid, []).get(p.ppid)!).push(p.pid);
+  const out: number[] = [];
+  const seen = new Set<number>();
+  const stack = [root];
+  while (stack.length) {
+    const pid = stack.pop()!;
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    out.push(pid);
+    for (const c of kids.get(pid) ?? []) stack.push(c);
+  }
+  return out;
+}
+
+/** Proportional Set Size (kB) for a pid via smaps_rollup; 0 if unavailable. */
+export function readPss(pid: number): number {
+  try {
+    const m = readFileSync(`/proc/${pid}/smaps_rollup`, "utf8").match(/^Pss:\s+(\d+)\s*kB/m);
+    if (m) return Number(m[1]);
+  } catch {
+    /* not Linux / process gone / no permission */
+  }
+  return 0;
+}
+
+/** Sum memory (kB) over pids: PSS where available, else the ps RSS fallback. */
+export function sumMemoryKb(pids: number[], procs: Map<number, Proc>): number {
+  let kb = 0;
+  for (const pid of pids) {
+    const pss = readPss(pid);
+    kb += pss > 0 ? pss : procs.get(pid)?.rssKb ?? 0;
+  }
+  return kb;
+}
+
+/** A process's working directory via /proc (Linux), else "". */
+export function procCwd(pid: number): string {
+  try {
+    return readlinkSync(`/proc/${pid}/cwd`);
+  } catch {
+    return "";
+  }
+}
+
+/** A running `claude remote-control` server process, parsed from `ps eww`. */
+export interface RcServerProc {
+  pid: number;
+  configDir: string; // CLAUDE_CONFIG_DIR the server runs under
+  cwd: string; // /proc/<pid>/cwd
+  spawn: string; // same-dir | worktree | session
+  capacity: number;
+  permissionMode: string;
+  name: string;
+}
+
+/** Parse a remote-control command line into a server record (shared by both paths). */
+function parseRcServer(pid: number, cmd: string, configDir: string): RcServerProc {
+  const grab = (re: RegExp) => cmd.match(re)?.[1] ?? "";
+  // No CLAUDE_CONFIG_DIR in the env ⇒ the DEFAULT account, whose data dir is ~/.claude.
+  return {
+    pid,
+    configDir: configDir || join(homedir(), ".claude"),
+    cwd: procCwd(pid),
+    spawn: grab(/--spawn[ =](\S+)/) || "same-dir",
+    capacity: Number(grab(/--capacity[ =](\d+)/)) || 32,
+    permissionMode: grab(/--permission-mode[ =](\S+)/),
+    name: grab(/--name[ =]("[^"]+"|\S+)/).replace(/^"|"$/g, ""),
+  };
+}
+
+/**
+ * Discover live `claude remote-control` servers. On Linux (the host side) we read
+ * /proc directly — argv from cmdline, CLAUDE_CONFIG_DIR from environ — which is
+ * reliable regardless of the ps flavour. Falls back to `ps eww` (BSD/macOS).
+ */
+export function findRcServers(): RcServerProc[] {
+  const servers: RcServerProc[] = [];
+  // Linux: /proc is authoritative for both argv and env.
+  let pids: string[] = [];
+  try {
+    pids = readdirSync("/proc").filter((n) => /^\d+$/.test(n));
+  } catch {
+    /* not Linux */
+  }
+  if (pids.length) {
+    for (const p of pids) {
+      let argv: string[] = [];
+      try {
+        argv = readFileSync(`/proc/${p}/cmdline`, "utf8").split("\0").filter(Boolean);
+      } catch {
+        continue; // process vanished / no permission
+      }
+      // the REAL server has argv[0] basename "claude" + a "remote-control" subcommand;
+      // this excludes the tmux wrapper whose cmdline merely *contains* that string.
+      const base = (argv[0] ?? "").split("/").pop() ?? "";
+      if (base !== "claude" || !argv.includes("remote-control")) continue;
+      const cmd = argv.join(" ");
+      let configDir = "";
+      try {
+        const env = readFileSync(`/proc/${p}/environ`, "utf8");
+        configDir = env.split("\0").find((kv) => kv.startsWith("CLAUDE_CONFIG_DIR="))?.slice("CLAUDE_CONFIG_DIR=".length) ?? "";
+      } catch {
+        /* environ unreadable */
+      }
+      servers.push(parseRcServer(Number(p), cmd, configDir));
+    }
+    return servers;
+  }
+  // macOS / BSD fallback: env-inclusive ps.
+  try {
+    const out = Bun.spawnSync(["ps", "eww", "-axo", "pid,command"]).stdout.toString();
+    for (const line of out.split("\n")) {
+      const pm = line.match(/^\s*(\d+)\s+(.*)$/);
+      if (!pm) continue;
+      const cmd = pm[2];
+      // argv[0] must be the claude binary (not a tmux/ssh wrapper that mentions it)
+      if (!/^(\S*\/)?claude\s+\S*remote-control\b/.test(cmd)) continue;
+      servers.push(parseRcServer(Number(pm[1]), cmd, cmd.match(/CLAUDE_CONFIG_DIR=(\S+)/)?.[1] ?? ""));
+    }
+  } catch {
+    /* ps unavailable */
+  }
+  return servers;
+}
+
+/** Live (process still alive) registry sessions for a config dir. */
+export function liveSessions(configDir: string): RegEntry[] {
+  return readRegistry(configDir).filter((e) => pidAlive(e.pid));
+}
+
 function prettyPlan(acc: any): string {
   const tier: string = acc.organizationRateLimitTier ?? "";
   const m = tier.match(/max_(\d+x)/i);
@@ -304,10 +467,10 @@ function prettyPlan(acc: any): string {
   return "";
 }
 
-function readAccount(configDir: string): AccountInfo {
+function readAccount(accountFile: string): AccountInfo {
   const empty: AccountInfo = { email: "", login: "", org: "", role: "", plan: "" };
   try {
-    const raw = readFileSync(join(configDir, ".claude.json"), "utf8");
+    const raw = readFileSync(accountFile, "utf8");
     const o = JSON.parse(raw);
     const acc = o.oauthAccount ?? {};
     return {
@@ -364,7 +527,7 @@ function isUserSession(m: SessionMeta): boolean {
 }
 
 /** A running session as recorded in Claude Code's own registry (sessions/*.json). */
-interface RegEntry {
+export interface RegEntry {
   sessionId: string;
   cwd: string;
   status: string; // busy | idle | shell | ...
@@ -446,7 +609,7 @@ export function collectInstance(
   now: number,
   running: Map<string, number>,
 ): InstanceState {
-  const account = readAccount(def.configDir);
+  const account = readAccount(def.accountFile ?? join(def.configDir, ".claude.json"));
   const isRunning = (running.get(def.configDir) ?? 0) > 0;
   const projectsDir = join(def.configDir, "projects");
   const files = listSessionFiles(projectsDir);

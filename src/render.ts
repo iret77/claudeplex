@@ -3,8 +3,14 @@ import { readTranscript, allFolders, instanceFolders, type TLine, type FolderUsa
 import { BUDGET_5H, BUDGET_WEEK } from "./instances.ts";
 import { formatCost, formatDuration, formatTokens, type WindowTotals } from "./usage.ts";
 import {
-  RESET, BOLD, DIM, fg, bg, rgb, vwidth, pad, trunc, center, rule, meter, heat, overlayBox,
+  RESET, BOLD, DIM, vwidth, pad, trunc, center, rule, meter, heat, overlayBox,
+  tfg, tbg, flatten, gradientRow, lerp, ICONS, type RGB, type Surface,
 } from "./ui.ts";
+import { getTheme, instanceShade, THEMES, type Theme } from "./theme.ts";
+import type { Host } from "./hosts.ts";
+import { sshTarget } from "./hosts.ts";
+import type { FsEntry } from "./ssh.ts";
+import type { RemoteSnapshot } from "./remote.ts";
 import { isFlashing, type SessState } from "./tracker.ts";
 import type { AgentRegistry } from "./agents.ts";
 import type { ManagedAgent, AgentLine } from "./agent.ts";
@@ -18,12 +24,85 @@ const HOME = homedir();
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const STREAM = ["⟩  ", "⟩⟩ ", "⟩⟩⟩", " ⟩⟩", "  ⟩"];
 
-const STATUS_COLOR: Record<Status, number> = {
-  WORKING: 46, LIVE: 51, IDLE: 244, OFFLINE: 240,
-};
-const STATUS_DOT: Record<Status, string> = {
-  WORKING: "", LIVE: "●", IDLE: "○", OFFLINE: "·",
-};
+/* ── Theme token shortcuts ────────────────────────────────────────────────────
+ * The active theme is read fresh on every call (cheap — a cached object) so a
+ * live theme switch takes effect on the next frame. `c(...)` returns the SGR for
+ * a colour token; the named helpers below are just the common ones spelled out. */
+const TH = (): Theme => getTheme();
+const c = (col: RGB): string => tfg(col);
+const cText = () => tfg(TH().text);
+const cText2 = () => tfg(TH().text2);
+const cText3 = () => tfg(TH().text3);
+const cDim = () => tfg(TH().textDim);
+const cOk = () => tfg(TH().success);
+const cWarn = () => tfg(TH().warning);
+const cErr = () => tfg(TH().error);
+const cAcc = () => tfg(TH().accent);
+const cAccHi = () => tfg(TH().accentHi);
+
+/** Per-instance grey shade (set once per frame in render(), keyed by instance). */
+let shadeMap = new Map<string, RGB>();
+const instColor = (key: string): RGB => shadeMap.get(key) ?? TH().text2;
+
+/**
+ * Re-assert a background colour after every RESET in `s`, then terminate. Lets a
+ * row carry one continuous bg even though the inner text resets fg freely. The
+ * trailing RESET hands the gutter back to the page-bg compositor (see render()).
+ */
+function bgRow(s: string, color: RGB): string {
+  const set = tbg(color);
+  return set + s.split(RESET).join(RESET + set) + RESET;
+}
+
+/** Paint a box's rows with its surface gradient — lighter at the top edge. */
+function surfaceBox(rows: string[], surf: Surface): string[] {
+  return rows.map((r, i) => bgRow(r, gradientRow(surf, i, rows.length)));
+}
+
+/**
+ * Lay one frame line onto the page canvas: page bg is set at the start and
+ * re-asserted after every RESET, so gaps and the right gutter fill with the
+ * page colour (the trailing \x1b[K in the draw loop carries it to the edge).
+ * Surface boxes re-assert THEIR bg immediately after each reset, so they win
+ * inside the box; only the truly empty cells fall through to the page.
+ */
+function pageWrap(line: string, page: RGB): string {
+  const set = tbg(page);
+  return set + line.split(RESET).join(RESET + set);
+}
+
+/**
+ * A bordered, gradient-filled panel — the full-width sibling of boxCard, used by
+ * the detail/transcript/cockpit views. `accent` tints all edges (focus); without
+ * it the edges use the light-top / dark-bottom neutral border.
+ */
+function panel(label: string, badge: string, content: string[], innerW: number, surf: Surface, accent?: RGB): string[] {
+  const tint = borderTints(surf, accent);
+  const top = `${c(tint.top)}╭${RESET}` + rule(` ${label} `, badge ? ` ${badge} ` : "", innerW, "─", tint.top) + `${c(tint.top)}╮${RESET}`;
+  const mids = content.map((l) => `${c(tint.mid)}│${RESET} ` + pad(l, innerW - 2) + ` ${c(tint.mid)}│${RESET}`);
+  const bottom = `${c(tint.btm)}╰${"─".repeat(innerW)}╯${RESET}`;
+  return surfaceBox([top, ...mids, bottom], surf);
+}
+
+/** Border-edge tints, flattened against the surface they enclose. */
+function borderTints(surf: Surface, accent?: RGB): { top: RGB; mid: RGB; btm: RGB } {
+  const th = TH();
+  if (accent) return { top: accent, mid: accent, btm: accent };
+  return {
+    top: flatten(surf.top, th.borderTop),
+    mid: flatten(lerp(surf.top, surf.btm, 0.5), th.borderSubtleTop),
+    btm: flatten(surf.btm, th.borderBtm),
+  };
+}
+
+/** Status of an instance process, expressed only as a coloured glyph + word. */
+function statusVisual(status: Status): { color: RGB; dot: string } {
+  const th = TH();
+  if (status === "WORKING") return { color: th.success, dot: "" };
+  if (status === "LIVE") return { color: th.accentHi, dot: ICONS.active };
+  if (status === "IDLE") return { color: th.text3, dot: ICONS.idle };
+  return { color: th.textDim, dot: ICONS.tool };
+}
 
 const MIN_CARD = 54;
 const TRANSCRIPT_LINES = 200;
@@ -53,12 +132,13 @@ function timeAgo(ms: number): string {
   return `${Math.round(h / 24)}d`;
 }
 function actIcon(k: SessionSummary["activityKind"]): string {
-  return k === "tool" ? "🔧" : k === "text" ? "💬" : k === "user" ? "🧑" : "·";
+  return k === "tool" ? ICONS.tool : k === "text" ? ICONS.text : k === "user" ? ICONS.prompt : ICONS.tool;
 }
+/** Plan badge, text-only (no background pill). Max gets the accent, others stay grey. */
 function planChip(plan: string): string {
   if (!plan) return "";
-  const c = /max/i.test(plan) ? 170 : 39; // Max=violet, team=blue
-  return `${bg(c)}${fg(231)}${BOLD} ${plan} ${RESET}`;
+  const col = /max/i.test(plan) ? TH().accentHi : TH().text3;
+  return `${tfg(col)}${BOLD}${plan}${RESET}`;
 }
 
 /** Right-align `right` after `left` within `width` (space filler). */
@@ -68,10 +148,11 @@ function spread(left: string, right: string, width: number): string {
 }
 
 function statTrail(t: WindowTotals, withMsg: boolean): string {
+  const sep = `${cDim()}·${RESET}`;
   return (
-    `${formatTokens(t.work)}` +
-    (withMsg ? ` ${DIM}·${RESET} ${t.messages}m` : "") +
-    ` ${DIM}·${RESET} ${formatCost(t.cost)}`
+    `${cText3()}${formatTokens(t.work)}${RESET}` +
+    (withMsg ? ` ${sep} ${cText3()}${t.messages}m${RESET}` : "") +
+    ` ${sep} ${cText3()}${formatCost(t.cost)}${RESET}`
   );
 }
 
@@ -80,19 +161,21 @@ function loadRow(
   resetAt: number, now: number,
 ): string {
   const pct = t.work / budget;
-  const c = heat(pct);
-  const rest = resetAt > now ? ` ${DIM}↻ ${formatDuration(resetAt - now)}${RESET}` : "";
-  const trail = ` ${fg(c)}${BOLD}${String(Math.round(pct * 100)).padStart(3)}%${RESET} ${DIM}${statTrail(t, withMsg)}${RESET}${rest}`;
+  const th = TH();
+  const col = heat(pct, th.success, th.warning, th.error);
+  const rest = resetAt > now ? ` ${cDim()}${ICONS.refresh} ${formatDuration(resetAt - now)}${RESET}` : "";
+  const trail = ` ${tfg(col)}${BOLD}${String(Math.round(pct * 100)).padStart(3)}%${RESET} ${statTrail(t, withMsg)}${rest}`;
   const barW = Math.max(8, innerW - 4 - vwidth(trail));
-  return `${DIM}${tag}${RESET} ${meter(pct, barW, c)}${trail}`;
+  return `${cText3()}${tag}${RESET} ${meter(pct, barW, col, th.textDim)}${trail}`;
 }
 
-interface Vis { color: number; glyph: string; }
+interface Vis { color: RGB; glyph: string; }
 function visual(state: SessState): Vis {
-  if (state === "aktiv") return { color: 46, glyph: "◆" };
-  if (state === "monitor") return { color: 39, glyph: "◑" };
-  if (state === "wartet") return { color: 220, glyph: "◐" };
-  return { color: 245, glyph: "○" };
+  const th = TH();
+  if (state === "aktiv") return { color: th.success, glyph: ICONS.active };
+  if (state === "monitor") return { color: th.accentHi, glyph: ICONS.monitor };
+  if (state === "wartet") return { color: th.warning, glyph: ICONS.waiting };
+  return { color: th.text3, glyph: ICONS.idle };
 }
 
 const CTX_MAX_ENV = Number(process.env.CD_CTX_MAX ?? 0);
@@ -112,28 +195,31 @@ function modelFamily(m: string): string {
   const mm = m.match(/(opus|sonnet|haiku|fable)/i);
   return mm ? mm[1][0].toUpperCase() + mm[1].slice(1) : "";
 }
-function modelColor(m: string): number {
-  if (/opus/i.test(m)) return 170;
-  if (/sonnet/i.test(m)) return 39;
-  if (/haiku/i.test(m)) return 78;
-  if (/fable/i.test(m)) return 213;
-  return 245;
+/** Model family tint — kept within the single-accent palette (shades + success). */
+function modelColor(m: string): RGB {
+  const th = TH();
+  if (/opus/i.test(m)) return th.accentHi;
+  if (/sonnet/i.test(m)) return th.accent;
+  if (/haiku/i.test(m)) return th.success;
+  if (/fable/i.test(m)) return th.accentHi2;
+  return th.text3;
 }
-function ctxColor(pct: number): number {
-  return pct >= 0.85 ? 196 : pct >= 0.6 ? 214 : 46; // green / orange / red
+function ctxColor(pct: number): RGB {
+  const th = TH();
+  return pct >= 0.85 ? th.error : pct >= 0.6 ? th.warning : th.success;
 }
 /** Compact inline cluster: context % (colored) · model family · thinking. */
 function ctxModelSuffix(ss: SessionSummary): string {
   const parts: string[] = [];
-  if (ss.bg) parts.push(`${fg(45)}⚙${RESET}`);
+  if (ss.bg) parts.push(`${cAcc()}${ICONS.background}${RESET}`);
   if (ss.ctxTokens > 0) {
     const pct = ss.ctxTokens / ctxMaxFor(ss.model, ss.ctxTokens);
-    parts.push(`${fg(ctxColor(pct))}${Math.round(pct * 100)}%${RESET}`);
+    parts.push(`${c(ctxColor(pct))}${Math.round(pct * 100)}%${RESET}`);
   }
   const fam = modelFamily(ss.model);
-  if (fam) parts.push(`${fg(modelColor(ss.model))}${fam}${RESET}`);
+  if (fam) parts.push(`${c(modelColor(ss.model))}${fam}${RESET}`);
   let s = parts.join(` ${DIM}·${RESET} `);
-  if (ss.thinking) s += `${DIM} 🧠${RESET}`;
+  if (ss.thinking) s += `${cText3()} ${ICONS.thinking}${RESET}`;
   return s;
 }
 
@@ -169,13 +255,13 @@ function sessionRow(ss: SessionSummary, w: number, frame: number, now: number, i
   const state = ss.state;
   const v = visual(state);
   const glyph = state === "aktiv" ? SPINNER[frame % SPINNER.length] : v.glyph;
-  const badge = `${fg(v.color)}${glyph} ${stateLabel(state).padEnd(7)}${RESET}`;
+  const badge = `${c(v.color)}${glyph} ${stateLabel(state).padEnd(7)}${RESET}`;
   const name = ss.title
     ? `${BOLD}${ss.title}${RESET}`
     : ss.cwd ? `${DIM}~${dirName(ss.cwd)}${RESET}` : `${DIM}${t("untitled")}${RESET}`;
   const flashing = isFlashing(ss.sessionId, now);
   const blink = flashing && Math.floor(frame / 2) % 2 === 0;
-  const mark = blink ? `${fg(231)}▌${RESET}` : flashing ? `${fg(v.color)}▌${RESET}` : " ";
+  const mark = blink ? `${cText()}▌${RESET}` : flashing ? `${c(v.color)}▌${RESET}` : " ";
   const suffix = ctxModelSuffix(ss);
   const right = `${suffix ? suffix + "  " : ""}${DIM}${timeAgo(age)}${RESET}`;
   const body = spread(`${badge} ${name}`, right, w - indent - 2);
@@ -186,7 +272,7 @@ const SESS_CAP = 26;
 
 function sessionLines(s: InstanceState, w: number, frame: number, now: number): string[] {
   const out: string[] = [];
-  const accent = s.def.color;
+  const accent = instColor(s.def.key);
   const shown = s.sessions;
   if (!shown.length) {
     out.push(`${DIM}${t("noSessions")}${RESET}`);
@@ -197,14 +283,14 @@ function sessionLines(s: InstanceState, w: number, frame: number, now: number): 
   const staleN = shown.length - liveN;
   const groups = groupByFolder(shown);
   out.push(
-    `${fg(accent)}▸${RESET} ${BOLD}${liveN} ${t("running")}${RESET} ${DIM}(${workN} ${t("active")})${RESET}` +
+    `${c(accent)}▸${RESET} ${BOLD}${liveN} ${t("running")}${RESET} ${DIM}(${workN} ${t("active")})${RESET}` +
     (staleN ? `  ${DIM}· ${staleN} ${t("recent")}${RESET}` : "") +
-    `  ${DIM}·${RESET} ${fg(accent)}${groups.length} ${t("folders")}${RESET}`,
+    `  ${DIM}·${RESET} ${c(accent)}${groups.length} ${t("folders")}${RESET}`,
   );
   let count = 0;
   for (const g of groups) {
     if (count >= SESS_CAP) break;
-    out.push(` ${fg(accent)}📁 ${dirName(g.full)}${RESET} ${DIM}(${g.sessions.length})${RESET}`);
+    out.push(` ${c(accent)}${ICONS.folder} ${dirName(g.full)}${RESET} ${DIM}(${g.sessions.length})${RESET}`);
     for (const ss of g.sessions) {
       if (count >= SESS_CAP) break;
       out.push(sessionRow(ss, w, frame, now, 3));
@@ -218,8 +304,8 @@ function sessionLines(s: InstanceState, w: number, frame: number, now: number): 
 function cardContent(s: InstanceState, innerW: number, frame: number, now: number): string[] {
   const a = s.account;
   const lines: string[] = [];
-  lines.push(spread(`👤 ${fg(s.def.color)}${BOLD}${a.login || "—"}${RESET}`, `${DIM}${a.email}${RESET}`, innerW));
-  const meta = [a.role && `${DIM}${a.role}${RESET}`, a.org && `${DIM}🏢 ${a.org}${RESET}`].filter(Boolean).join(`  `);
+  lines.push(spread(`${ICONS.account} ${c(instColor(s.def.key))}${BOLD}${a.login || "—"}${RESET}`, `${DIM}${a.email}${RESET}`, innerW));
+  const meta = [a.role && `${DIM}${a.role}${RESET}`, a.org && `${DIM}${ICONS.org} ${a.org}${RESET}`].filter(Boolean).join(`  `);
   lines.push(`${planChip(a.plan)}  ${meta}`);
   lines.push("");
   for (const l of sessionLines(s, innerW, frame, now)) lines.push(l);
@@ -232,18 +318,20 @@ function cardContent(s: InstanceState, innerW: number, frame: number, now: numbe
 function boxCard(
   s: InstanceState, content: string[], innerW: number, frame: number, selected: boolean,
 ): string[] {
-  const accent = s.def.color;
-  const bcol = selected ? 231 : accent;
-  const sc = STATUS_COLOR[s.status];
-  const spin = s.status === "WORKING" ? SPINNER[frame % SPINNER.length] : STATUS_DOT[s.status];
-  const mark = selected ? `${fg(231)}▌ ${RESET}` : "";
-  const label = `${mark}${fg(accent)}${BOLD}${s.def.key}${RESET} ${fg(accent)}${s.def.label}${RESET}`;
-  const badge = `${fg(sc)}${spin} ${BOLD}${s.status}${RESET}`;
-  const B = (ch: string) => `${fg(bcol)}${selected ? BOLD : ""}${ch}${RESET}`;
-  const top = B("╭") + rule(` ${label} `, ` ${badge} `, innerW, "─", bcol) + B("╮");
-  const bottom = B("╰") + `${fg(bcol)}${"─".repeat(innerW)}${RESET}` + B("╯");
-  const mids = content.map((l) => B("│") + " " + pad(l, innerW - 2) + " " + B("│"));
-  return [top, ...mids, bottom];
+  const th = TH();
+  const inst = instColor(s.def.key);
+  const surf = th.raised;
+  const sv = statusVisual(s.status);
+  const spin = s.status === "WORKING" ? SPINNER[frame % SPINNER.length] : sv.dot;
+  const tint = borderTints(surf, selected ? th.accent : undefined);
+  const mark = selected ? `${cText()}${ICONS.bar} ${RESET}` : "";
+  const label = `${mark}${c(inst)}${BOLD}${s.def.key}${RESET} ${c(inst)}${s.def.label}${RESET}`;
+  const badge = `${c(sv.color)}${spin}${spin ? " " : ""}${BOLD}${s.status}${RESET}`;
+  const bold = selected ? BOLD : "";
+  const top = `${c(tint.top)}${bold}╭${RESET}` + rule(` ${label} `, ` ${badge} `, innerW, "─", tint.top) + `${c(tint.top)}${bold}╮${RESET}`;
+  const bottom = `${c(tint.btm)}${bold}╰${"─".repeat(innerW)}╯${RESET}`;
+  const mids = content.map((l) => `${c(tint.mid)}${bold}│${RESET} ` + pad(l, innerW - 2) + ` ${c(tint.mid)}${bold}│${RESET}`);
+  return surfaceBox([top, ...mids, bottom], surf);
 }
 
 function gridRow(cards: string[][], gap: number): string[] {
@@ -279,13 +367,29 @@ function headerLines(states: InstanceState[], frame: number, now: number, W: num
   const tok5h = states.reduce((a, s) => a + s.block5h.work, 0);
   const cost5h = states.reduce((a, s) => a + s.block5h.cost, 0);
   const clock = new Date(now).toLocaleTimeString(localeTag());
-  const title = `${SPINNER[frame % SPINNER.length]} ${BOLD}${rgb(244, 114, 182)}CLAUDEPLEX${RESET} ${DIM}│${RESET} ${BOLD}MULTI-INSTANCE${RESET}`;
+  const sep = `${cDim()}│${RESET}`;
+  const title = `${cAcc()}${SPINNER[frame % SPINNER.length]}${RESET} ${BOLD}${cAcc()}CLAUDEPLEX${RESET} ${sep} ${BOLD}${cText2()}MULTI-INSTANCE${RESET}`;
   const summary =
-    `${fg(51)}${BOLD}${liveSess}${RESET} ${t("sessionsLive")}  ${fg(46)}●${RESET} ${workingSess} ${t("working")}  ` +
-    `${DIM}│${RESET} ${liveInst}/${states.length} ${t("instances")}  ` +
-    `${DIM}│${RESET} 5h ${BOLD}${formatTokens(tok5h)}${RESET} ${DIM}${t("tok")}${RESET} ${formatCost(cost5h)}  ` +
-    `${DIM}│${RESET} ${fg(45)}${clock}${RESET}`;
-  return [rule(`${title} `, ` ${summary}`, W, "━", 240), ""];
+    `${cAccHi()}${BOLD}${liveSess}${RESET} ${cText2()}${t("sessionsLive")}${RESET}  ${cOk()}${ICONS.active}${RESET} ${cText2()}${workingSess} ${t("working")}${RESET}  ` +
+    `${sep} ${cText2()}${liveInst}/${states.length} ${t("instances")}${RESET}  ` +
+    `${sep} ${cText3()}5h${RESET} ${BOLD}${cText2()}${formatTokens(tok5h)}${RESET} ${cText3()}${t("tok")}${RESET} ${cText2()}${formatCost(cost5h)}${RESET}  ` +
+    `${sep} ${cAcc()}${clock}${RESET}`;
+  return [rule(`${title} `, ` ${summary}`, W, "━", TH().textDim), ""];
+}
+
+/** One side of the two-pane Commander file browser. */
+export interface CmdPane {
+  host: string; // host name ("" = no host chosen yet)
+  path: string;
+  entries: FsEntry[]; // async-fetched listing of `path`
+  sel: number;
+  loading: boolean;
+  error: string;
+}
+
+/** A fresh, empty Commander pane. */
+export function emptyPane(): CmdPane {
+  return { host: "", path: "", entries: [], sel: 0, loading: false, error: "" };
 }
 
 export interface UIState {
@@ -316,6 +420,18 @@ export interface UIState {
   collapsed: { cards: boolean; live: boolean; questions: boolean };
   closeArm: string; // sessionId armed for close-confirm in the questions list
   renaming: string; // sessionId being renamed ("" = not renaming); buffer = input
+  // live theme quick-picker (p): scrub to preview, ⏎ commits, Esc restores
+  themePicker: boolean;
+  themeSel: number;
+  // multi-host Commander (h): Ebene 0 hosts → Ebene 1 two-pane files → control
+  commander: boolean;
+  cmdLevel: "hosts" | "files";
+  cmdHosts: Host[]; // resolved once on entry
+  cmdHostSel: number;
+  cmdActive: 0 | 1; // which pane has focus (Tab switches)
+  cmdPanes: [CmdPane, CmdPane]; // left / right file panes
+  cmdRemote: RemoteSnapshot | null; // fleet snapshot for the active pane's host
+  cmdFeedback: string; // transient result of an action (launch/stop/copy)
   // quick-issue flow (picker === "issue")
   issueStage: "pick" | "drafting" | "review" | "rewrite" | "creating" | "done" | "error";
   issuePane: "folder" | "desc"; // which pick-stage pane has focus
@@ -365,8 +481,8 @@ export function closeableSessions(states: InstanceState[]): WaitingSession[] {
 function liveOutputBlock(states: InstanceState[], W: number, focused = false, collapsed = false): string[] {
   const active = states.flatMap((s) => s.sessions.filter((x) => x.working).map((ss) => ({ s, ss })));
   const out: string[] = [""];
-  const hcol = focused ? 231 : 46;
-  out.push(rule(`${BOLD}${fg(hcol)}${collapsed ? "▸" : "▾"} ② LIVE OUTPUT${RESET} `, ` ${DIM}${active.length} ${t("active")}${RESET}`, W, "━", focused ? 231 : 240));
+  const hcol = focused ? TH().text : TH().success;
+  out.push(rule(`${BOLD}${c(hcol)}${collapsed ? "▸" : "▾"} ② LIVE OUTPUT${RESET} `, ` ${DIM}${active.length} ${t("active")}${RESET}`, W, "━", focused ? TH().text : TH().textDim));
   if (collapsed) return out;
   if (!active.length) {
     out.push(`  ${DIM}${t("noSessionGenerating")}${RESET}`);
@@ -376,7 +492,7 @@ function liveOutputBlock(states: InstanceState[], W: number, focused = false, co
   for (const { s, ss } of active.slice(0, CAP)) {
     out.push("");
     const head =
-      `${fg(s.def.color)}▶ ${BOLD}${s.def.key}${RESET} ${fg(s.def.color)}${ss.title || dirName(ss.cwd)}${RESET}` +
+      `${c(instColor(s.def.key))}▶ ${BOLD}${s.def.key}${RESET} ${c(instColor(s.def.key))}${ss.title || dirName(ss.cwd)}${RESET}` +
       `  ${DIM}${dirName(ss.cwd)}${RESET}`;
     out.push(trunc(head, W));
     const segs = ss.path ? readTranscript(ss.path).slice(-5) : [];
@@ -390,7 +506,7 @@ function liveOutputBlock(states: InstanceState[], W: number, focused = false, co
       let color: string;
       if (seg.role === "tool") {
         indent = 6;
-        prefix = `${fg(214)}🔧${RESET}`;
+        prefix = `${cText3()}${ICONS.tool}${RESET}`;
         color = DIM;
       } else if (seg.role === "result") {
         indent = 8;
@@ -398,11 +514,11 @@ function liveOutputBlock(states: InstanceState[], W: number, focused = false, co
         color = DIM;
       } else if (seg.role === "user") {
         indent = 4;
-        prefix = `${fg(51)}❯${RESET}`;
+        prefix = `${cAccHi()}❯${RESET}`;
         color = "";
       } else {
         indent = 4;
-        prefix = `${DIM}💬${RESET}`;
+        prefix = `${DIM}${ICONS.text}${RESET}`;
         color = "";
       }
       const flat = seg.text.replace(/\s+/g, " ");
@@ -431,7 +547,7 @@ function renderGrid(
 
   // region indicator: Tab / 1-3 switch focus between the three areas
   const chip = (num: string, label: string, on: boolean) =>
-    on ? `${bg(238)}${fg(231)}${BOLD} ${num} ${label} ${RESET}` : `${DIM} ${num} ${label} ${RESET}`;
+    on ? `${cAccHi()}${BOLD}${num} ${label}${RESET}` : `${cText3()}${num} ${label}${RESET}`;
   out.push(
     `${chip("①", t("cards"), region === "cards")}  ${chip("②", "Live", region === "live")}  ` +
     `${chip("③", t("openQuestions"), region === "questions")}   ${DIM}${t("switchInstances1to3")} · 2× ▾/▸${RESET}`,
@@ -443,12 +559,12 @@ function renderGrid(
       const cnt = (st: string) => s.sessions.filter((x) => x.state === st).length;
       const a = cnt("aktiv"), m = cnt("monitor"), wt = cnt("wartet"), sl = cnt("stale");
       const bgN = s.sessions.filter((x) => x.bg).length;
-      const ses = [a && `${fg(46)}◆${a}${RESET}`, m && `${fg(39)}◑${m}${RESET}`, wt && `${fg(220)}◐${wt}${RESET}`, sl && `${fg(245)}○${sl}${RESET}`, bgN && `${fg(45)}⚙${bgN}${RESET}`].filter(Boolean).join(" ");
-      return `${fg(s.def.color)}${BOLD}${s.def.key}${RESET} ${fg(s.def.color)}${s.def.label}${RESET} ` +
+      const ses = [a && `${cOk()}◆${a}${RESET}`, m && `${cAcc()}◑${m}${RESET}`, wt && `${cWarn()}◐${wt}${RESET}`, sl && `${cText3()}○${sl}${RESET}`, bgN && `${cAcc()}${ICONS.background}${bgN}${RESET}`].filter(Boolean).join(" ");
+      return `${c(instColor(s.def.key))}${BOLD}${s.def.key}${RESET} ${c(instColor(s.def.key))}${s.def.label}${RESET} ` +
         `${loadTag("5h", s.block5h.work, BUDGET_5H)} ${loadTag("wk", s.week.work, BUDGET_WEEK)}` +
         (ses ? `  ${ses}` : "");
     });
-    out.push(`  ${region === "cards" ? fg(231) : DIM}▸ ① ${t("cards")}${RESET}   ${cells.join(`  ${DIM}│${RESET}  `)}`);
+    out.push(`  ${region === "cards" ? cText() : DIM}▸ ① ${t("cards")}${RESET}   ${cells.join(`  ${DIM}│${RESET}  `)}`);
     out.push("");
   } else {
     for (let i = 0; i < cards.length; i += cols) {
@@ -467,13 +583,13 @@ function renderGrid(
   const st = qs.length - ws;
   out.push("");
   out.push(rule(
-    `${BOLD}${fg(qFocus ? 231 : 220)}${ui.collapsed.questions ? "▸" : "▾"} ③ WAITING / STALE${RESET} ${DIM}(${ws} ${stateLabel("wartet")} · ${st} stale)${RESET} `,
-    qFocus ? ` ${DIM}↑/↓ ${t("select")} · ⏎ ${t("openVerb")} · e ${t("rename")} · x ${t("close")}${RESET} ` : "", W, "━", qFocus ? 231 : 240,
+    `${BOLD}${c(qFocus ? TH().text : TH().warning)}${ui.collapsed.questions ? "▸" : "▾"} ③ WAITING / STALE${RESET} ${DIM}(${ws} ${stateLabel("wartet")} · ${st} stale)${RESET} `,
+    qFocus ? ` ${DIM}↑/↓ ${t("select")} · ⏎ ${t("openVerb")} · e ${t("rename")} · x ${t("close")}${RESET} ` : "", W, "━", qFocus ? TH().text : TH().textDim,
   ));
   if (!ui.collapsed.questions) {
   if (ui.renaming) {
-    const caret = Math.floor(frame / 3) % 2 === 0 ? `${fg(231)}▏${RESET}` : " ";
-    out.push(`  ${fg(213)}✎ ${t("renameLabel")}${RESET} ${ui.input}${caret}   ${DIM}${t("saveCancel")}${RESET}`);
+    const caret = Math.floor(frame / 3) % 2 === 0 ? `${cText()}▏${RESET}` : " ";
+    out.push(`  ${cAccHi()}✎ ${t("renameLabel")}${RESET} ${ui.input}${caret}   ${DIM}${t("saveCancel")}${RESET}`);
   }
   if (!qs.length) out.push(`  ${DIM}${t("noSessions")}${RESET}`);
   // inline-flow rows: INST STATE TIME title · worktree — message (tight, no columns)
@@ -505,7 +621,7 @@ function renderGrid(
   view.forEach((d, vi) => {
     if (d.spacer) { if (vi > 0) out.push(""); return; }
     if (d.header !== undefined) {
-      out.push(`  ${fg(74)}📦 ${d.header}${RESET} ${DIM}(${d.count})${RESET}`);
+      out.push(`  ${cAcc()}${ICONS.repo} ${d.header}${RESET} ${DIM}(${d.count})${RESET}`);
       return;
     }
     const w = d.w!, i = d.i!;
@@ -513,15 +629,15 @@ function renderGrid(
     const armed = ui.closeArm === w.ss.sessionId;
     const open = !!registry?.forSession(w.ss.sessionId);
     const v = visual(w.ss.state);
-    const marker = armed ? `${fg(196)}✗${RESET}` : sel ? `${fg(231)}▶${RESET}` : open ? `${fg(46)}●${RESET}` : " ";
-    const inst = `${fg(w.def.color)}${pad(w.def.key, 4)}${RESET}`;
-    const stateTag = open ? `${fg(46)}${pad(`✎ ${t("open")}`, 7)}${RESET}` : `${fg(v.color)}${pad(stateLabel(w.ss.state), 7)}${RESET}`;
+    const marker = armed ? `${cErr()}✗${RESET}` : sel ? `${cText()}▶${RESET}` : open ? `${cOk()}●${RESET}` : " ";
+    const inst = `${c(instColor(w.def.key))}${pad(w.def.key, 4)}${RESET}`;
+    const stateTag = open ? `${cOk()}${pad(`✎ ${t("open")}`, 7)}${RESET}` : `${c(v.color)}${pad(stateLabel(w.ss.state), 7)}${RESET}`;
     const titleRaw = registry?.nameOverride(w.ss.sessionId) ?? (w.ss.title || "~" + dirName(w.ss.cwd));
     const wt = repoParts(w.ss.cwd).worktree;
-    const titlePart = `${sel ? `${BOLD}${fg(231)}` : fg(252)}${titleRaw}${RESET}${wt ? ` ${DIM}·${RESET} ${fg(108)}${wt}${RESET}` : ""}`;
+    const titlePart = `${sel ? `${BOLD}${cText()}` : cText2()}${titleRaw}${RESET}${wt ? ` ${DIM}·${RESET} ${cText3()}${wt}${RESET}` : ""}`;
     const timeCol = `${DIM}${clock(w.ss.lastTs)}${RESET}`;
     const last = (w.ss.activity || "").replace(/\s+/g, " ");
-    const msg = armed ? `  ${fg(196)}${t("closeConfirm")}${RESET}` : last ? ` ${DIM}— ${last}${RESET}` : "";
+    const msg = armed ? `  ${cErr()}${t("closeConfirm")}${RESET}` : last ? ` ${DIM}— ${last}${RESET}` : "";
     out.push(trunc(`${marker} ${inst} ${stateTag} ${timeCol} ${titlePart}${msg}`, W));
   });
   const shown = view.filter((d) => d.w).length;
@@ -531,23 +647,23 @@ function renderGrid(
 
   out.push("");
   out.push(
-    `${fg(46)}◆ ${stateLabel("aktiv")}${RESET} ${DIM}·${RESET} ${fg(39)}◑ ${stateLabel("monitor")}${RESET} ${DIM}·${RESET} ${fg(220)}◐ ${stateLabel("wartet")}${RESET} ${DIM}·${RESET} ${fg(245)}○ ${stateLabel("stale")}${RESET} ${DIM}·${RESET} ${fg(45)}⚙ background${RESET}`,
+    `${cOk()}◆ ${stateLabel("aktiv")}${RESET} ${DIM}·${RESET} ${cAcc()}◑ ${stateLabel("monitor")}${RESET} ${DIM}·${RESET} ${cWarn()}◐ ${stateLabel("wartet")}${RESET} ${DIM}·${RESET} ${cText3()}○ ${stateLabel("stale")}${RESET} ${DIM}·${RESET} ${cAcc()}${ICONS.background} background${RESET}`,
   );
   out.push(
     qFocus
-      ? `${fg(231)}↑/↓${RESET}${DIM} ${t("question")}${RESET}  ${fg(231)}⏎${RESET}${DIM} ${t("answerCockpit")}${RESET}  ` +
-        `${fg(231)}[x]${RESET}${DIM} ${t("closeSession")}${RESET}  ${fg(231)}Tab/1-3${RESET}${DIM} ${t("area")}${RESET}  ${DIM}[q] quit${RESET}`
-      : `${fg(231)}↑/↓${RESET}${DIM} ${t("instance")}${RESET}  ${fg(231)}→/⏎${RESET}${DIM} Sessions${RESET}  ` +
-        `${fg(231)}Tab/1-3${RESET}${DIM} ${t("area")}${RESET}  ${fg(231)}[c]${RESET}${DIM} Cockpit${RESET}  ${fg(231)}[i]${RESET}${DIM} Issue${RESET}  ` +
-        `${fg(231)}[n]${RESET}${DIM} Agent${RESET}  ${fg(231)}[N]${RESET}${DIM} ${t("here")}${RESET}  ${fg(231)}[A]${RESET}${DIM} ${t("all")}${RESET}  ${DIM}[r/q]${RESET}`,
+      ? `${cText()}↑/↓${RESET}${DIM} ${t("question")}${RESET}  ${cText()}⏎${RESET}${DIM} ${t("answerCockpit")}${RESET}  ` +
+        `${cText()}[x]${RESET}${DIM} ${t("closeSession")}${RESET}  ${cText()}Tab/1-3${RESET}${DIM} ${t("area")}${RESET}  ${DIM}[q] quit${RESET}`
+      : `${cText()}↑/↓${RESET}${DIM} ${t("instance")}${RESET}  ${cText()}→/⏎${RESET}${DIM} Sessions${RESET}  ` +
+        `${cText()}Tab/1-3${RESET}${DIM} ${t("area")}${RESET}  ${cText()}[c]${RESET}${DIM} Cockpit${RESET}  ${cText()}[i]${RESET}${DIM} Issue${RESET}  ` +
+        `${cText()}[n]${RESET}${DIM} Agent${RESET}  ${cText()}[N]${RESET}${DIM} ${t("here")}${RESET}  ${cText()}[A]${RESET}${DIM} ${t("all")}${RESET}  ${cText()}[p]${RESET}${DIM} Theme${RESET}  ${DIM}[r/q]${RESET}`,
   );
   return out;
 }
 
 function renderDetail(states: InstanceState[], frame: number, now: number, W: number, ui: UIState): string[] {
   const s = states[ui.sel];
-  const accent = s.def.color;
-  const sc = STATUS_COLOR[s.status];
+  const accent = TH().accent;
+  const sc = statusVisual(s.status).color;
   const innerW = W - 2;
   const textW = innerW - 2;
 
@@ -559,39 +675,39 @@ function renderDetail(states: InstanceState[], frame: number, now: number, W: nu
 
   let idx = 0;
   for (const g of groups) {
-    content.push(`${fg(accent)}📁 ${tilde(g.full) || "?"}${RESET}  ${DIM}(${g.sessions.length})${RESET}`);
+    content.push(`${c(accent)}${ICONS.folder} ${tilde(g.full) || "?"}${RESET}  ${DIM}(${g.sessions.length})${RESET}`);
     for (const ss of g.sessions) {
       const on = idx++ === sel;
       const state = ss.state;
       const v = visual(state);
       const glyph = state === "aktiv" ? SPINNER[frame % SPINNER.length] : v.glyph;
-      const dot = `${fg(v.color)}${glyph}${RESET}`;
+      const dot = `${c(v.color)}${glyph}${RESET}`;
       const flashing = isFlashing(ss.sessionId, now);
       const blink = flashing && Math.floor(frame / 2) % 2 === 0;
       const marker = on
-        ? `${fg(231)}▶${RESET}`
-        : blink ? `${fg(231)}▌${RESET}` : flashing ? `${fg(v.color)}▌${RESET}` : " ";
+        ? `${cText()}▶${RESET}`
+        : blink ? `${cText()}▌${RESET}` : flashing ? `${c(v.color)}▌${RESET}` : " ";
       const nm = ss.cwd ? dirName(ss.cwd) : "";
       const title = ss.title
-        ? `${BOLD}${fg(on ? 231 : 252)}${ss.title}${RESET}`
+        ? `${BOLD}${c(on ? TH().text : TH().text2)}${ss.title}${RESET}`
         : nm ? `${DIM}~${nm}${RESET}` : `${DIM}${t("untitled")}${RESET}`;
       const ago = `${DIM}${timeAgo(now - ss.lastTs)}${RESET}`;
-      const tag = `${fg(v.color)}${stateLabel(state)}${RESET}`;
+      const tag = `${c(v.color)}${stateLabel(state)}${RESET}`;
       content.push("  " + spread(`${marker} ${dot} ${title}`, `${tag}  ${ago}`, textW - 2));
       if (on) {
-        const where = `${fg(accent)}📂${RESET} ${tilde(ss.cwd) || "?"}${ss.gitBranch ? `   ${DIM}⌥ ${ss.gitBranch}${RESET}` : ""}`;
+        const where = `${c(accent)}${ICONS.folder}${RESET} ${tilde(ss.cwd) || "?"}${ss.gitBranch ? `   ${DIM}${ICONS.branch} ${ss.gitBranch}${RESET}` : ""}`;
         content.push("      " + trunc(where, textW - 6));
         const cmax = ctxMaxFor(ss.model, ss.ctxTokens);
         const cpct = ss.ctxTokens ? ss.ctxTokens / cmax : 0;
         const ctxStr = ss.ctxTokens
-          ? `${fg(accent)}📊${RESET} Context ${fg(ctxColor(cpct))}${formatTokens(ss.ctxTokens)}/${formatTokens(cmax)} (${Math.round(cpct * 100)}%)${RESET}`
-          : `${fg(accent)}📊${RESET} ${DIM}Context —${RESET}`;
-        const mdlStr = ss.model ? `  ${DIM}·${RESET} ${fg(modelColor(ss.model))}${prettyModel(ss.model)}${RESET}` : "";
-        const thinkStr = ss.thinking ? `  ${DIM}·${RESET} 🧠 ${DIM}Thinking${RESET}` : "";
-        const bgStr = ss.bg ? `  ${DIM}·${RESET} ${fg(45)}⚙ background${RESET}` : "";
+          ? `${c(accent)}${ICONS.context}${RESET} Context ${c(ctxColor(cpct))}${formatTokens(ss.ctxTokens)}/${formatTokens(cmax)} (${Math.round(cpct * 100)}%)${RESET}`
+          : `${c(accent)}${ICONS.context}${RESET} ${DIM}Context —${RESET}`;
+        const mdlStr = ss.model ? `  ${DIM}·${RESET} ${c(modelColor(ss.model))}${prettyModel(ss.model)}${RESET}` : "";
+        const thinkStr = ss.thinking ? `  ${DIM}·${RESET} ${ICONS.thinking} ${DIM}Thinking${RESET}` : "";
+        const bgStr = ss.bg ? `  ${DIM}·${RESET} ${cAcc()}${ICONS.background} background${RESET}` : "";
         content.push("      " + trunc(`${ctxStr}${mdlStr}${thinkStr}${bgStr}`, textW - 6));
         content.push(`      ${DIM}id ${ss.sessionId.slice(0, 8)}${RESET}`);
-        const arrow = ss.working ? `${fg(sc)}${STREAM[frame % STREAM.length]}${RESET}` : `${DIM}⟩${RESET}`;
+        const arrow = ss.working ? `${c(sc)}${STREAM[frame % STREAM.length]}${RESET}` : `${DIM}⟩${RESET}`;
         const lines = wrap(ss.activity || "—", textW - 10, 4);
         lines.forEach((wln, wi) => {
           const lead = wi === 0 ? `${arrow} ${actIcon(ss.activityKind)}` : "    ";
@@ -602,21 +718,17 @@ function renderDetail(states: InstanceState[], frame: number, now: number, W: nu
     }
   }
 
-  const label = `${fg(accent)}${BOLD}${s.def.key}${RESET} ${fg(accent)}${s.def.label}${RESET} ${DIM}· ${s.account.login} · ${s.account.plan}${RESET}`;
+  const label = `${c(accent)}${BOLD}${s.def.key}${RESET} ${c(accent)}${s.def.label}${RESET} ${DIM}· ${s.account.login} · ${s.account.plan}${RESET}`;
   const liveN = flat.filter((x) => x.live).length;
   const badge = flat.length
-    ? `${fg(sc)}${BOLD}${flat.length} Session${flat.length === 1 ? "" : "s"}${RESET} ${DIM}(${liveN} live)${RESET}`
+    ? `${c(sc)}${BOLD}${flat.length} Session${flat.length === 1 ? "" : "s"}${RESET} ${DIM}(${liveN} live)${RESET}`
     : `${DIM}${t("none")}${RESET}`;
-  const B = (ch: string) => `${fg(accent)}${ch}${RESET}`;
-
   const out = headerLines(states, frame, now, W);
-  out.push(B("╭") + rule(` ${label} `, ` ${badge} `, innerW, "─", accent) + B("╮"));
-  for (const l of content) out.push(B("│") + " " + pad(l, textW) + " " + B("│"));
-  out.push(B("╰") + `${fg(accent)}${"─".repeat(innerW)}${RESET}` + B("╯"));
+  for (const l of panel(label, badge, content, innerW, TH().raised, accent)) out.push(l);
   out.push("");
   out.push(
-    `${fg(231)}↑/↓${RESET}${DIM} Session${RESET}  ${fg(231)}→/⏎${RESET}${DIM} ${t("transcriptLast")}${RESET}  ` +
-    `${fg(231)}←/Esc${RESET}${DIM} Grid${RESET}  ${DIM}[q] ${t("quit")}${RESET}`,
+    `${cText()}↑/↓${RESET}${DIM} Session${RESET}  ${cText()}→/⏎${RESET}${DIM} ${t("transcriptLast")}${RESET}  ` +
+    `${cText()}←/Esc${RESET}${DIM} Grid${RESET}  ${DIM}[q] ${t("quit")}${RESET}`,
   );
   return out;
 }
@@ -636,12 +748,12 @@ function transcriptDisplayLines(segs: TLine[], width: number): string[] {
 
     if (seg.role === "assistant") {
       // full markdown rendering (tables, lists, headings, inline styles) under a gutter bar
-      for (const ml of renderMarkdown(seg.text, width - 4)) lines.push(`  ${fg(108)}▎${RESET} ${ml}`);
+      for (const ml of renderMarkdown(seg.text, width - 4)) lines.push(`  ${cText3()}▎${RESET} ${ml}`);
     } else if (seg.role === "user") {
       const w = wrap(seg.text, width - 3, 8);
-      w.forEach((wl, i) => lines.push(`${i === 0 ? `${fg(51)}❯${RESET} ` : "  "}${fg(45)}${BOLD}${wl}${RESET}`));
+      w.forEach((wl, i) => lines.push(`${i === 0 ? `${cAccHi()}❯${RESET} ` : "  "}${cAcc()}${BOLD}${wl}${RESET}`));
     } else if (seg.role === "tool") {
-      lines.push(`    ${fg(214)}🔧${RESET} ${fg(250)}${trunc(seg.text.replace(/\s+/g, " "), width - 8)}${RESET}`);
+      lines.push(`    ${cText3()}${ICONS.tool}${RESET} ${cText2()}${trunc(seg.text.replace(/\s+/g, " "), width - 8)}${RESET}`);
     } else {
       const w = wrap(seg.text, width - 10, 2);
       w.forEach((wl, i) => lines.push(`       ${DIM}${i === 0 ? "⎿ " : "  "}${wl}${RESET}`));
@@ -662,7 +774,7 @@ function renderTranscript(
     out.push(`${DIM}${t("noSession")}${RESET}`);
     return out;
   }
-  const accent = s.def.color;
+  const accent = TH().accent;
   const innerW = W - 2;
   const textW = innerW - 2;
 
@@ -677,24 +789,27 @@ function renderTranscript(
   const view = pool.slice(start, end);
 
   const name = ss.title || (ss.cwd ? "~" + dirName(ss.cwd) : t("untitled"));
-  const label = `${fg(accent)}${BOLD}📄 ${s.def.key}${RESET} ${BOLD}${trunc(name, 46)}${RESET}  ${DIM}${dirName(ss.cwd)}${RESET}`;
+  const label = `${c(accent)}${BOLD}${ICONS.file} ${s.def.key}${RESET} ${BOLD}${trunc(name, 46)}${RESET}  ${DIM}${dirName(ss.cwd)}${RESET}`;
   const pos = `${DIM}${start + 1}–${end} / ${pool.length}${scroll > 0 ? " ↑" : ""}${RESET}`;
-  const B = (ch: string) => `${fg(accent)}${ch}${RESET}`;
-  out.push(B("╭") + rule(` ${label} `, ` ${pos} `, innerW, "─", accent) + B("╮"));
-  for (const l of view) out.push(B("│") + " " + pad(l, textW) + " " + B("│"));
-  for (let i = view.length; i < vh; i++) out.push(B("│") + " " + pad("", textW) + " " + B("│"));
-  out.push(B("╰") + `${fg(accent)}${"─".repeat(innerW)}${RESET}` + B("╯"));
+  const body = [...view];
+  for (let i = view.length; i < vh; i++) body.push("");
+  for (const l of panel(label, pos, body, innerW, TH().sunken, accent)) out.push(l);
   out.push("");
   out.push(
-    `${fg(231)}↑/↓${RESET}${DIM} ${t("scroll")}${RESET}  ${fg(231)}PgUp/PgDn${RESET}${DIM} ${t("pagewise")}${RESET}  ` +
-    `${fg(231)}←/Esc${RESET}${DIM} ${t("back")}${RESET}  ${DIM}[q] ${t("quit")}${RESET}`,
+    `${cText()}↑/↓${RESET}${DIM} ${t("scroll")}${RESET}  ${cText()}PgUp/PgDn${RESET}${DIM} ${t("pagewise")}${RESET}  ` +
+    `${cText()}←/Esc${RESET}${DIM} ${t("back")}${RESET}  ${DIM}[q] ${t("quit")}${RESET}`,
   );
   return out;
 }
 
-const AGENT_STATE_COLOR: Record<string, number> = {
-  starting: 220, ready: 46, busy: 51, dead: 240,
-};
+/** Managed-agent lifecycle colour, resolved against the live theme each call. */
+function agentStateColor(state: string): RGB {
+  const th = TH();
+  return state === "starting" ? th.warning
+    : state === "ready" ? th.success
+    : state === "busy" ? th.accentHi
+    : th.textDim;
+}
 
 /** Render one managed-agent line (same hierarchy as the transcript view). */
 function agentBodyLines(a: ManagedAgent, width: number): string[] {
@@ -708,7 +823,7 @@ function agentBodyLines(a: ManagedAgent, width: number): string[] {
   const lines = transcriptDisplayLines(segs, width);
   if (a.pending) {
     // live streaming preview of the in-flight assistant turn
-    for (const wl of wrap(a.pending, width - 5, 8)) lines.push(`  ${fg(108)}▎${RESET} ${wl}`);
+    for (const wl of wrap(a.pending, width - 5, 8)) lines.push(`  ${cText3()}▎${RESET} ${wl}`);
   }
   return lines;
 }
@@ -775,8 +890,8 @@ function renderCockpit(
   if (!tabs.length) {
     out.push(`${DIM}${t("noAgentsWaiting")}${RESET}`);
     out.push("");
-    out.push(`${fg(231)}^N${RESET}${DIM} ${t("startAgent")}${RESET}  ` +
-      `${fg(231)}[A]${RESET}${DIM} ${t("startAll")}${RESET}  ${fg(231)}Esc${RESET}${DIM} ${t("back")}${RESET}`);
+    out.push(`${cText()}^N${RESET}${DIM} ${t("startAgent")}${RESET}  ` +
+      `${cText()}[A]${RESET}${DIM} ${t("startAll")}${RESET}  ${cText()}Esc${RESET}${DIM} ${t("back")}${RESET}`);
     return out;
   }
 
@@ -785,8 +900,7 @@ function renderCockpit(
   const focus = tabs[fi];
   const listActive = ui.cockpitArea === "list";
 
-  const accent = focus.def?.color ?? 45;
-  const B = (ch: string) => `${fg(accent)}${ch}${RESET}`;
+  const accent = TH().accent;
 
   // ── ACTIVE SESSION (top) — no tab bar ──
   let head: string;
@@ -796,25 +910,25 @@ function renderCockpit(
   if (focus.kind === "agent") {
     const a = focus.agent;
     dead = a.state === "dead";
-    head = `${fg(accent)}${BOLD}▶ ${focus.def?.key ?? ""} ${trunc(agentName(a), 42)}${RESET}` +
+    head = `${c(accent)}${BOLD}${ICONS.cursor} ${focus.def?.key ?? ""} ${trunc(agentName(a), 42)}${RESET}` +
       `  ${DIM}${tilde(a.opts.cwd)}${RESET}` +
-      (a.model ? `  ${fg(modelColor(a.model))}${prettyModel(a.model)}${RESET}` : "") +
-      `  ${fg(AGENT_STATE_COLOR[a.state] ?? 245)}${a.state === "ready" ? t("waitingForInput") : a.state}${RESET}` +
-      (a.error ? `  ${fg(196)}${trunc(a.error, 36)}${RESET}` : "");
+      (a.model ? `  ${c(modelColor(a.model))}${prettyModel(a.model)}${RESET}` : "") +
+      `  ${c(agentStateColor(a.state))}${a.state === "ready" ? t("waitingForInput") : a.state}${RESET}` +
+      (a.error ? `  ${cErr()}${trunc(a.error, 36)}${RESET}` : "");
     const ctxMax = ctxMaxFor(a.model, a.ctxTokens);
     const ctxPct = a.ctxTokens ? a.ctxTokens / ctxMax : 0;
     stats = [
-      a.ctxTokens ? `${fg(ctxColor(ctxPct))}⊞ ${formatTokens(a.ctxTokens)}/${formatTokens(ctxMax)} ${Math.round(ctxPct * 100)}%${RESET}` : "",
+      a.ctxTokens ? `${c(ctxColor(ctxPct))}${ICONS.context} ${formatTokens(a.ctxTokens)}/${formatTokens(ctxMax)} ${Math.round(ctxPct * 100)}%${RESET}` : "",
       a.outTokens ? `${DIM}↓${RESET} ${formatTokens(a.outTokens)}` : "",
-      a.costUsd ? `${fg(220)}${formatCost(a.costUsd)}${RESET}` : "",
+      a.costUsd ? `${cWarn()}${formatCost(a.costUsd)}${RESET}` : "",
     ].filter(Boolean).join(`${DIM} · ${RESET}`);
     body = agentBodyLines(a, textW);
   } else {
     const ss = focus.ss;
-    head = `${fg(accent)}${BOLD}◐ ${focus.def?.key ?? ""} ${focus.def?.label ?? ""}${RESET}` +
+    head = `${c(accent)}${BOLD}${ICONS.waiting} ${focus.def?.key ?? ""} ${focus.def?.label ?? ""}${RESET}` +
       `  ${DIM}${tilde(ss.cwd)}${RESET}` +
-      (ss.model ? `  ${fg(modelColor(ss.model))}${prettyModel(ss.model)}${RESET}` : "") +
-      `  ${fg(220)}${t("waitingForInput")}${RESET}`;
+      (ss.model ? `  ${c(modelColor(ss.model))}${prettyModel(ss.model)}${RESET}` : "") +
+      `  ${cWarn()}${t("waitingForInput")}${RESET}`;
     body = transcriptDisplayLines(readTranscript(ss.path), textW);
   }
 
@@ -822,24 +936,23 @@ function renderCockpit(
   const listMax = Math.min(tabs.length, 8);
   const vh = Math.max(3, height - listMax - 7); // header(2)+top(1)+bottom(1)+input(1)+listrule(1)+hints(1)
 
-  out.push(B("╭") + rule(` ${head} `, stats ? ` ${stats} ` : "", innerW, "─", accent) + B("╮"));
   const view = body.slice(-vh);
-  for (const l of view) out.push(B("│") + " " + pad(l, textW) + " " + B("│"));
-  for (let i = view.length; i < vh; i++) out.push(B("│") + " " + pad("", textW) + " " + B("│"));
-  out.push(B("╰") + `${fg(accent)}${"─".repeat(innerW)}${RESET}` + B("╯"));
+  const boxBody = [...view];
+  for (let i = view.length; i < vh; i++) boxBody.push("");
+  for (const l of panel(head, stats, boxBody, innerW, TH().sunken, accent)) out.push(l);
 
   // input bar (dim when the lower list has focus)
-  const caret = Math.floor(frame / 3) % 2 === 0 ? `${fg(231)}▏${RESET}` : " ";
-  const imgTag = ui.pendingImages.length ? ` ${fg(213)}📎${ui.pendingImages.length}${RESET}` : "";
+  const caret = Math.floor(frame / 3) % 2 === 0 ? `${cText()}▏${RESET}` : " ";
+  const imgTag = ui.pendingImages.length ? ` ${cAccHi()}${ICONS.attach}${ui.pendingImages.length}${RESET}` : "";
   const prompt = dead
-    ? `${fg(196)}✗ ${t("agentStopped")}${RESET}`
-    : `${listActive ? DIM : fg(46)}❯${RESET} ${listActive ? DIM : ""}${ui.input}${RESET}${imgTag}${listActive ? "" : caret}`;
+    ? `${cErr()}✗ ${t("agentStopped")}${RESET}`
+    : `${listActive ? DIM : cOk()}❯${RESET} ${listActive ? DIM : ""}${ui.input}${RESET}${imgTag}${listActive ? "" : caret}`;
   out.push(pad(prompt, W));
 
   // ── OFFENE FRAGEN (lower list) — waiting sessions + agents with last message ──
   out.push(rule(
-    `${BOLD}${fg(220)}◐ ${t("openQuestions").toUpperCase()}${RESET} ${DIM}(${tabs.length})${RESET} `,
-    ` ${fg(231)}Tab${RESET}${DIM} ${listActive ? t("toInput") : t("toList")}${RESET} `, W, "─", listActive ? 231 : 240,
+    `${BOLD}${cWarn()}◐ ${t("openQuestions").toUpperCase()}${RESET} ${DIM}(${tabs.length})${RESET} `,
+    ` ${cText()}Tab${RESET}${DIM} ${listActive ? t("toInput") : t("toList")}${RESET} `, W, "─", listActive ? TH().text : TH().textDim,
   ));
   const lsel = Math.min(Math.max(0, ui.listSel), tabs.length - 1);
   if (listActive) ui.listSel = lsel;
@@ -848,21 +961,21 @@ function renderCockpit(
   tabs.slice(0, showN).forEach((t, i) => {
     const isActive = t.id === ui.focus;
     const isSel = listActive && i === lsel;
-    const marker = isSel ? `${fg(231)}▶${RESET}` : isActive ? `${fg(accent)}▌${RESET}` : " ";
-    let gcol: number;
+    const marker = isSel ? `${cText()}▶${RESET}` : isActive ? `${c(accent)}▌${RESET}` : " ";
+    let gcol: RGB;
     let glyph: string;
     let label: string;
     if (t.kind === "agent") {
-      gcol = AGENT_STATE_COLOR[t.agent.state] ?? 245;
+      gcol = agentStateColor(t.agent.state);
       glyph = t.agent.state === "busy" ? SPINNER[frame % SPINNER.length] : t.agent.state === "ready" ? "●" : "○";
       label = `${t.def?.key ?? "?"} ${agentName(t.agent)}`;
     } else {
-      gcol = 220;
-      glyph = "◐";
+      gcol = TH().warning;
+      glyph = ICONS.waiting;
       label = `${t.def?.key ?? "?"} ${t.ss.title || dirName(t.ss.cwd)}`;
     }
     const last = lastMessageOf(t).replace(/\s+/g, " ");
-    const left = `${marker} ${fg(gcol)}${glyph}${RESET} ${isSel ? BOLD : ""}${trunc(label, 24)}${RESET}`;
+    const left = `${marker} ${c(gcol)}${glyph}${RESET} ${isSel ? BOLD : ""}${trunc(label, 24)}${RESET}`;
     out.push(trunc(left + (last ? `  ${DIM}⟩ ${last}${RESET}` : ""), W));
   });
   if (overflow) out.push(`  ${DIM}… +${tabs.length - showN} ${t("further")}${RESET}`);
@@ -870,11 +983,11 @@ function renderCockpit(
   // hints depend on which area has focus
   out.push(
     listActive
-      ? `${fg(231)}↑/↓${RESET}${DIM} ${t("select")}${RESET}  ${fg(231)}⏎${RESET}${DIM} ${t("openVerb")}${RESET}  ` +
-        `${fg(231)}Tab${RESET}${DIM} ${t("toInput")}${RESET}  ${fg(231)}Esc${RESET}${DIM} ${t("toInput")}${RESET}`
-      : `${fg(231)}⏎${RESET}${DIM} ${focus.kind === "waiting" ? t("adoptSend") : t("send")}${RESET}  ` +
-        `${fg(231)}^V${RESET}${DIM} ${t("pasteImage")}${RESET}  ${fg(231)}Tab${RESET}${DIM} ${t("downQuestions")}${RESET}  ` +
-        `${fg(231)}^N${RESET}${DIM} ${t("new")}${RESET}  ${fg(231)}^R${RESET}${DIM} restart${RESET}  ${fg(231)}^K${RESET}${DIM} kill${RESET}  ${fg(231)}Esc${RESET}${DIM} ${t("back")}${RESET}`,
+      ? `${cText()}↑/↓${RESET}${DIM} ${t("select")}${RESET}  ${cText()}⏎${RESET}${DIM} ${t("openVerb")}${RESET}  ` +
+        `${cText()}Tab${RESET}${DIM} ${t("toInput")}${RESET}  ${cText()}Esc${RESET}${DIM} ${t("toInput")}${RESET}`
+      : `${cText()}⏎${RESET}${DIM} ${focus.kind === "waiting" ? t("adoptSend") : t("send")}${RESET}  ` +
+        `${cText()}^V${RESET}${DIM} ${t("pasteImage")}${RESET}  ${cText()}Tab${RESET}${DIM} ${t("downQuestions")}${RESET}  ` +
+        `${cText()}^N${RESET}${DIM} ${t("new")}${RESET}  ${cText()}^R${RESET}${DIM} restart${RESET}  ${cText()}^K${RESET}${DIM} kill${RESET}  ${cText()}Esc${RESET}${DIM} ${t("back")}${RESET}`,
   );
   return out;
 }
@@ -888,20 +1001,21 @@ export function recentCwds(states: InstanceState[], instanceKey: string): string
 /** Compact "5h 12%" / "wk 40%" load tag, heat-colored, for the wizard list. */
 function loadTag(label: string, work: number, budget: number): string {
   const pct = budget ? work / budget : 0;
-  return `${DIM}${label}${RESET} ${fg(heat(pct))}${String(Math.round(pct * 100)).padStart(2)}%${RESET}`;
+  const th = TH();
+  return `${cText3()}${label}${RESET} ${c(heat(pct, th.success, th.warning, th.error))}${String(Math.round(pct * 100)).padStart(2)}%${RESET}`;
 }
 
 /** One instance row in the wizard: identity left, plan + load + live right. */
 function wizardInstanceCell(s: InstanceState, on: boolean, w: number): string {
-  const mark = on ? `${fg(231)}▶${RESET}` : " ";
-  const dot = `${fg(s.def.color)}●${RESET}`;
+  const mark = on ? `${cText()}▶${RESET}` : " ";
+  const dot = `${c(instColor(s.def.key))}●${RESET}`;
   const liveN = s.sessions.filter((x) => x.live).length;
-  const name = `${on ? BOLD : ""}${fg(s.def.color)}${s.def.key}${RESET} ${on ? BOLD : ""}${s.def.label}${RESET}`;
+  const name = `${on ? BOLD : ""}${c(instColor(s.def.key))}${s.def.key}${RESET} ${on ? BOLD : ""}${s.def.label}${RESET}`;
   const left = `${mark} ${dot} ${name}`;
   const right =
     (s.account.plan ? `${planChip(s.account.plan)} ` : "") +
     `${loadTag("5h", s.block5h.work, BUDGET_5H)} ${loadTag("wk", s.week.work, BUDGET_WEEK)} ` +
-    `${liveN ? fg(51) + String(liveN) + "↑" + RESET : DIM + "·" + RESET}`;
+    `${liveN ? cAccHi() + String(liveN) + "↑" + RESET : DIM + "·" + RESET}`;
   return spread(left, right, w);
 }
 
@@ -988,28 +1102,28 @@ function renderIssueModal(
   W: number, height: number, ui: UIState,
 ): string[] {
   const backdrop = renderGrid(states, frame, now, W, ui, height, registry);
-  const accent = 213;
-  const B = (ch: string) => `${fg(accent)}${ch}${RESET}`;
+  const accent = TH().accentHi;
+  const B = (ch: string) => `${c(accent)}${ch}${RESET}`;
   const popupW = Math.min(W - 6, 124);
   const innerW = popupW - 2;
   const textW = innerW - 2;
   const bodyRows = Math.min(Math.max(8, height - 12), 24);
   const spin = SPINNER[frame % SPINNER.length];
-  const title = `${fg(accent)}${BOLD}📝 ${t("issueTitle")}${RESET}`;
+  const title = `${c(accent)}${BOLD}${ICONS.issue} ${t("issueTitle")}${RESET}`;
 
   const place = (box: string[]): string[] => {
     const top = Math.max(2, Math.floor((height - box.length) / 2));
     const left = Math.max(0, Math.floor((W - popupW) / 2));
-    return overlayBox(backdrop, box, top, left);
+    return overlayBox(backdrop, surfaceBox(box, TH().raised), top, left);
   };
 
   const frameBox = (rows: string[], tag: string, hint: string): string[] => {
     const box: string[] = [];
     box.push(B("╭") + rule(` ${title} `, ` ${tag} `, innerW, "─", accent) + B("╮"));
     for (let i = 0; i < bodyRows; i++) box.push(B("│") + " " + pad(rows[i] ?? "", textW) + " " + B("│"));
-    box.push(B("├") + `${fg(accent)}${"─".repeat(innerW)}${RESET}` + B("┤"));
+    box.push(B("├") + `${c(accent)}${"─".repeat(innerW)}${RESET}` + B("┤"));
     box.push(B("│") + " " + pad(hint, textW) + " " + B("│"));
-    box.push(B("╰") + `${fg(accent)}${"─".repeat(innerW)}${RESET}` + B("╯"));
+    box.push(B("╰") + `${c(accent)}${"─".repeat(innerW)}${RESET}` + B("╯"));
     return place(box);
   };
 
@@ -1024,28 +1138,28 @@ function renderIssueModal(
     const fsel = clampIdx(ui.issueFolderSel, folders.length);
     ui.issueFolderSel = fsel;
     const focusLeft = ui.issuePane === "folder";
-    const div = `${fg(accent)}│${RESET}`;
+    const div = `${c(accent)}│${RESET}`;
     const leftW = Math.max(30, Math.floor(textW * 0.5));
     const rightW = textW - leftW - 3;
 
     const folderCells = folders.map((f, i) => {
       const on = i === fsel;
-      const mark = on ? `${fg(231)}▶${RESET}` : " ";
-      const name = f.slug ? `${fg(74)}${f.label}${RESET}` : `${fg(74)}📁 ${tilde(f.cwd)}${RESET}`;
+      const mark = on ? `${cText()}▶${RESET}` : " ";
+      const name = f.slug ? `${cAcc()}${f.label}${RESET}` : `${cAcc()}${ICONS.folder} ${tilde(f.cwd)}${RESET}`;
       const left = `${mark} ${on ? BOLD : ""}${name}`;
       return spread(left, `${DIM}${f.users.length}× · ${timeAgo(now - f.lastTs)}${RESET}`, leftW);
     });
     const leftLines = paneLines(
-      `${focusLeft ? BOLD + fg(231) : DIM}${t("issueRepoHdr")}${RESET}${DIM}  ${folders.length} · ${t("uses")} · ${t("last")}${RESET}`,
+      `${focusLeft ? BOLD + cText() : DIM}${t("issueRepoHdr")}${RESET}${DIM}  ${folders.length} · ${t("uses")} · ${t("last")}${RESET}`,
       folderCells, fsel, bodyRows, `${DIM}${t("noFolderHistory")}${RESET}`,
     );
 
-    const caret = Math.floor(frame / 3) % 2 === 0 ? `${fg(231)}▏${RESET}` : " ";
+    const caret = Math.floor(frame / 3) % 2 === 0 ? `${cText()}▏${RESET}` : " ";
     const wrapped = wrapText(ui.issueInput, rightW - 1);
-    const rightLines: string[] = [`${!focusLeft ? BOLD + fg(231) : DIM}${t("issueDescHdr")}${RESET}`, ""];
+    const rightLines: string[] = [`${!focusLeft ? BOLD + cText() : DIM}${t("issueDescHdr")}${RESET}`, ""];
     wrapped.forEach((l, i) => {
       const last = i === wrapped.length - 1;
-      rightLines.push(`${fg(252)}${l}${RESET}${!focusLeft && last ? caret : ""}`);
+      rightLines.push(`${cText2()}${l}${RESET}${!focusLeft && last ? caret : ""}`);
     });
     rightLines.push("", `${DIM}${t("issueDescHint")}${RESET}`);
     while (rightLines.length < bodyRows) rightLines.push("");
@@ -1056,25 +1170,25 @@ function renderIssueModal(
       box.push(B("│") + " " + pad(leftLines[i] ?? "", leftW) + " " + div + " " + pad(rightLines[i] ?? "", rightW) + " " + B("│"));
     }
     const hint = focusLeft
-      ? `${fg(231)}↑/↓${RESET}${DIM} ${t("issueRepoShort")}${RESET}  ${fg(231)}Tab/→${RESET}${DIM} ${t("issueDescShort")}${RESET}  ${fg(231)}Esc${RESET}${DIM} ${t("closeShort")}${RESET}`
-      : `${fg(231)}${t("type")}${RESET}${DIM} ${t("issueDescShort")}${RESET}  ${fg(231)}⏎${RESET}${DIM} ${t("issueDraftVerb")}${RESET}  ${fg(231)}Tab/←${RESET}${DIM} ${t("issueRepoShort")}${RESET}  ${fg(231)}Esc${RESET}`;
-    box.push(B("├") + `${fg(accent)}${"─".repeat(innerW)}${RESET}` + B("┤"));
+      ? `${cText()}↑/↓${RESET}${DIM} ${t("issueRepoShort")}${RESET}  ${cText()}Tab/→${RESET}${DIM} ${t("issueDescShort")}${RESET}  ${cText()}Esc${RESET}${DIM} ${t("closeShort")}${RESET}`
+      : `${cText()}${t("type")}${RESET}${DIM} ${t("issueDescShort")}${RESET}  ${cText()}⏎${RESET}${DIM} ${t("issueDraftVerb")}${RESET}  ${cText()}Tab/←${RESET}${DIM} ${t("issueRepoShort")}${RESET}  ${cText()}Esc${RESET}`;
+    box.push(B("├") + `${c(accent)}${"─".repeat(innerW)}${RESET}` + B("┤"));
     box.push(B("│") + " " + pad(hint, textW) + " " + B("│"));
-    box.push(B("╰") + `${fg(accent)}${"─".repeat(innerW)}${RESET}` + B("╯"));
+    box.push(B("╰") + `${c(accent)}${"─".repeat(innerW)}${RESET}` + B("╯"));
     return place(box);
   }
 
   // ── drafting / creating: spinner ──
   if (ui.issueStage === "drafting" || ui.issueStage === "creating") {
     const label = ui.issueStage === "drafting"
-      ? `${t("issueDrafting")} ${fg(accent)}${ui.issueInstance || "?"}${RESET}${DIM} …${RESET}`
+      ? `${t("issueDrafting")} ${c(accent)}${ui.issueInstance || "?"}${RESET}${DIM} …${RESET}`
       : `${t("issueCreating")}`;
     const mid = [
-      center(`${fg(accent)}${spin}${RESET}  ${label}`, textW),
+      center(`${c(accent)}${spin}${RESET}  ${label}`, textW),
       "",
       center(`${DIM}${tilde(ui.issueRepo)}${RESET}`, textW),
     ];
-    return frameBox(centered(mid), t("issueWorking"), `${fg(231)}Esc${RESET}${DIM} ${t("cancel")}${RESET}`);
+    return frameBox(centered(mid), t("issueWorking"), `${cText()}Esc${RESET}${DIM} ${t("cancel")}${RESET}`);
   }
 
   // ── review / rewrite: the drafted issue as Markdown ──
@@ -1088,35 +1202,35 @@ function renderIssueModal(
     const rows: string[] = md.slice(scroll, scroll + viewRows).map((l) => `  ${l}`);
     while (rows.length < viewRows) rows.push("");
     if (isRewrite) {
-      const caret = Math.floor(frame / 3) % 2 === 0 ? `${fg(231)}▏${RESET}` : " ";
-      rows.push(`${fg(accent)}${"─".repeat(textW)}${RESET}`);
-      rows.push(`${BOLD}${fg(231)}${t("issueRewriteHdr")}${RESET}`);
-      rows.push(`${fg(46)}❯${RESET} ${fg(252)}${trunc(ui.issueFeedback, textW - 4)}${RESET}${caret}`);
+      const caret = Math.floor(frame / 3) % 2 === 0 ? `${cText()}▏${RESET}` : " ";
+      rows.push(`${c(accent)}${"─".repeat(textW)}${RESET}`);
+      rows.push(`${BOLD}${cText()}${t("issueRewriteHdr")}${RESET}`);
+      rows.push(`${cOk()}❯${RESET} ${cText2()}${trunc(ui.issueFeedback, textW - 4)}${RESET}${caret}`);
     }
     const tag = `${DIM}${scroll > 0 ? "↑ " : ""}${scroll < maxScroll ? "↓ " : ""}${tilde(ui.issueRepo)}${RESET}`;
     const hint = isRewrite
-      ? `${fg(231)}⏎${RESET}${DIM} ${t("issueRedraft")}${RESET}  ${fg(231)}Esc${RESET}${DIM} ${t("back")}${RESET}`
-      : `${fg(231)}⏎${RESET}${DIM} ${t("issueCreate")}${RESET}  ${fg(231)}r${RESET}${DIM} ${t("issueRewrite")}${RESET}  ${fg(231)}↑/↓${RESET}${DIM} ${t("scroll")}${RESET}  ${fg(231)}Esc${RESET}${DIM} ${t("cancel")}${RESET}`;
+      ? `${cText()}⏎${RESET}${DIM} ${t("issueRedraft")}${RESET}  ${cText()}Esc${RESET}${DIM} ${t("back")}${RESET}`
+      : `${cText()}⏎${RESET}${DIM} ${t("issueCreate")}${RESET}  ${cText()}r${RESET}${DIM} ${t("issueRewrite")}${RESET}  ${cText()}↑/↓${RESET}${DIM} ${t("scroll")}${RESET}  ${cText()}Esc${RESET}${DIM} ${t("cancel")}${RESET}`;
     return frameBox(rows, tag, hint);
   }
 
   // ── done ──
   if (ui.issueStage === "done") {
     const mid = [
-      center(`${fg(46)}✓ ${t("issueCreated")}${RESET}`, textW),
+      center(`${cOk()}✓ ${t("issueCreated")}${RESET}`, textW),
       "",
-      ...wrapText(ui.issueUrl, textW - 4).map((l) => center(`${fg(45)}${l}${RESET}`, textW)),
+      ...wrapText(ui.issueUrl, textW - 4).map((l) => center(`${cAcc()}${l}${RESET}`, textW)),
     ];
-    return frameBox(centered(mid), `${DIM}${tilde(ui.issueRepo)}${RESET}`, `${fg(231)}Esc${RESET}${DIM} ${t("closeShort")}${RESET}`);
+    return frameBox(centered(mid), `${DIM}${tilde(ui.issueRepo)}${RESET}`, `${cText()}Esc${RESET}${DIM} ${t("closeShort")}${RESET}`);
   }
 
   // ── error ──
   const emid = [
-    center(`${fg(196)}✗ ${t("issueErr")}${RESET}`, textW),
+    center(`${cErr()}✗ ${t("issueErr")}${RESET}`, textW),
     "",
-    ...wrapText(ui.issueError, textW - 4).map((l) => center(`${fg(252)}${l}${RESET}`, textW)),
+    ...wrapText(ui.issueError, textW - 4).map((l) => center(`${cText2()}${l}${RESET}`, textW)),
   ];
-  return frameBox(centered(emid), `${DIM}${tilde(ui.issueRepo)}${RESET}`, `${fg(231)}r${RESET}${DIM} ${t("issueRetry")}${RESET}  ${fg(231)}Esc${RESET}${DIM} ${t("closeShort")}${RESET}`);
+  return frameBox(centered(emid), `${DIM}${tilde(ui.issueRepo)}${RESET}`, `${cText()}r${RESET}${DIM} ${t("issueRetry")}${RESET}  ${cText()}Esc${RESET}${DIM} ${t("closeShort")}${RESET}`);
 }
 
 /**
@@ -1132,14 +1246,14 @@ function renderWizard(
   W: number, height: number, ui: UIState,
 ): string[] {
   const backdrop = renderGrid(states, frame, now, W, ui, height, registry);
-  const accent = 45;
+  const accent = TH().accent;
   const folderMode = ui.pickerMode === "folder";
   const focusLeft = ui.pickerPane === "instance";
   const popupW = Math.min(W - 6, 124);
   const innerW = popupW - 2;
   const textW = innerW - 2;
-  const B = (ch: string) => `${fg(accent)}${ch}${RESET}`;
-  const div = `${fg(accent)}│${RESET}`;
+  const B = (ch: string) => `${c(accent)}${ch}${RESET}`;
+  const div = `${c(accent)}│${RESET}`;
   const leftW = Math.max(34, Math.min(textW - 24, Math.floor(textW * (folderMode ? 0.56 : 0.62))));
   const rightW = textW - leftW - 3;
   const bodyRows = Math.min(Math.max(8, height - 12), 24);
@@ -1154,7 +1268,7 @@ function renderWizard(
     const def = states.find((s) => s.def.key === ui.pickerInstance)?.def ?? states[instSel]?.def;
     const instCells = states.map((s, i) => wizardInstanceCell(s, i === instSel, leftW));
     leftLines = paneLines(
-      `${focusLeft ? BOLD + fg(231) : DIM}${t("instance").toUpperCase()}${RESET}${DIM}  Plan · 5h · wk · live${RESET}`,
+      `${focusLeft ? BOLD + cText() : DIM}${t("instance").toUpperCase()}${RESET}${DIM}  Plan · 5h · wk · live${RESET}`,
       instCells, instSel, bodyRows, `${DIM}${t("noInstances")}${RESET}`,
     );
 
@@ -1163,20 +1277,20 @@ function renderWizard(
       : recentCwds(states, ui.pickerInstance);
     const sugg = dirSuggestions(ui.pickerInput, history, 60);
     const valid = isDir(ui.pickerInput);
-    const caret = Math.floor(frame / 3) % 2 === 0 ? `${fg(231)}▏${RESET}` : " ";
-    const pcol = valid ? fg(252) : fg(196);
+    const caret = Math.floor(frame / 3) % 2 === 0 ? `${cText()}▏${RESET}` : " ";
+    const pcol = valid ? cText2() : cErr();
     const rsel = clampIdx(ui.pickerSel, sugg.length);
     ui.pickerSel = rsel;
     const suggCells = sugg.map((sg, i) => {
       const on = !focusLeft && i === rsel;
       const rl = repoLabel(sg);
-      return `${on ? `${fg(231)}▶${RESET}` : " "} ${on ? BOLD : ""}${tilde(sg)}${RESET}${rl ? `  ${DIM}${rl}${RESET}` : ""}`;
+      return `${on ? `${cText()}▶${RESET}` : " "} ${on ? BOLD : ""}${tilde(sg)}${RESET}${rl ? `  ${DIM}${rl}${RESET}` : ""}`;
     });
     // header band: path field + validity, then the windowed suggestion list
-    const rHdr = `${!focusLeft ? BOLD + fg(231) : DIM}WORKING-FOLDER${RESET}${DIM}  ${sugg.length} ${t("fromHistory")}${RESET}`;
+    const rHdr = `${!focusLeft ? BOLD + cText() : DIM}WORKING-FOLDER${RESET}${DIM}  ${sugg.length} ${t("fromHistory")}${RESET}`;
     const fieldRows = [
-      `${fg(46)}❯${RESET} ${pcol}${trunc(ui.pickerInput, rightW - 2)}${RESET}${focusLeft ? "" : caret}`,
-      valid ? `${DIM}✓ ${t("folderExists")}${RESET}` : `${fg(196)}✗ ${t("existsShort")}${RESET}`,
+      `${cOk()}❯${RESET} ${pcol}${trunc(ui.pickerInput, rightW - 2)}${RESET}${focusLeft ? "" : caret}`,
+      valid ? `${DIM}✓ ${t("folderExists")}${RESET}` : `${cErr()}✗ ${t("existsShort")}${RESET}`,
       "",
     ];
     const listCap = Math.max(1, bodyRows - 2 - fieldRows.length);
@@ -1197,14 +1311,14 @@ function renderWizard(
     ui.pickerInstSel = fsel;
     const folder = folders[fsel];
     const folderCells = folders.map((f, i) => {
-      const mark = i === fsel ? `${fg(231)}▶${RESET}` : " ";
+      const mark = i === fsel ? `${cText()}▶${RESET}` : " ";
       const rl = repoLabel(f.cwd);
-      const name = rl ? `${fg(74)}${rl}${RESET}` : `${fg(74)}📁 ${tilde(f.cwd)}${RESET}`;
+      const name = rl ? `${cAcc()}${rl}${RESET}` : `${cAcc()}${ICONS.folder} ${tilde(f.cwd)}${RESET}`;
       const left = `${mark} ${i === fsel ? BOLD : ""}${name}`;
       return spread(left, `${DIM}${f.users.length}× · ${timeAgo(now - f.lastTs)}${RESET}`, leftW);
     });
     leftLines = paneLines(
-      `${focusLeft ? BOLD + fg(231) : DIM}${t("folders").toUpperCase()}${RESET}${DIM}  ${folders.length} · ${t("uses")} · ${t("last")}${RESET}`,
+      `${focusLeft ? BOLD + cText() : DIM}${t("folders").toUpperCase()}${RESET}${DIM}  ${folders.length} · ${t("uses")} · ${t("last")}${RESET}`,
       folderCells, fsel, bodyRows, `${DIM}${t("noFolderHistory")}${RESET}`,
     );
 
@@ -1214,20 +1328,20 @@ function renderWizard(
     ui.pickerSel = isel;
     const instCells = ordered.map((s, i) => {
       const on = !focusLeft && i === isel;
-      const dot = `${fg(s.def.color)}●${RESET}`;
+      const dot = `${c(instColor(s.def.key))}●${RESET}`;
       const used = usedTs.has(s.def.key);
-      const tag = used ? `${fg(46)}✓ ${timeAgo(now - usedTs.get(s.def.key)!)}${RESET}` : `${DIM}${t("override")}${RESET}`;
-      const name = `${on ? BOLD : ""}${fg(s.def.color)}${s.def.key}${RESET} ${on ? BOLD : ""}${s.def.label}${RESET}`;
-      return spread(`${on ? `${fg(231)}▶${RESET}` : " "} ${dot} ${name}`, tag, rightW);
+      const tag = used ? `${cOk()}✓ ${timeAgo(now - usedTs.get(s.def.key)!)}${RESET}` : `${DIM}${t("override")}${RESET}`;
+      const name = `${on ? BOLD : ""}${c(instColor(s.def.key))}${s.def.key}${RESET} ${on ? BOLD : ""}${s.def.label}${RESET}`;
+      return spread(`${on ? `${cText()}▶${RESET}` : " "} ${dot} ${name}`, tag, rightW);
     });
     rightLines = paneLines(
-      `${!focusLeft ? BOLD + fg(231) : DIM}${t("instance").toUpperCase()}${RESET}${DIM}  ${t("usedThisFolder")}${RESET}`,
+      `${!focusLeft ? BOLD + cText() : DIM}${t("instance").toUpperCase()}${RESET}${DIM}  ${t("usedThisFolder")}${RESET}`,
       instCells, isel, bodyRows, `${DIM}—${RESET}`,
     );
   }
 
   // ── assemble the popup box ──
-  const title = `${fg(accent)}${BOLD}🚀 ${t("newAgent")}${RESET}`;
+  const title = `${c(accent)}${BOLD}${ICONS.newAgent} ${t("newAgent")}${RESET}`;
   const modeTag = `${DIM}${folderMode ? t("modeFolderToInstance") : t("modeInstanceToFolder")} · ^T ${t("switches")}${RESET}`;
   const box: string[] = [];
   box.push(B("╭") + rule(` ${title} `, ` ${modeTag} `, innerW, "─", accent) + B("╮"));
@@ -1235,14 +1349,163 @@ function renderWizard(
     box.push(B("│") + " " + pad(leftLines[i] ?? "", leftW) + " " + div + " " + pad(rightLines[i] ?? "", rightW) + " " + B("│"));
   }
   const hint = focusLeft
-    ? `${fg(231)}↑/↓${RESET}${DIM} ${folderMode ? t("folder") : t("instance")}${RESET}  ${fg(231)}Tab/→/⏎${RESET}${DIM} ${folderMode ? t("instance") : t("folder")}${RESET}  ${fg(231)}^T${RESET}${DIM} ${t("mode")}${RESET}  ${fg(231)}Esc${RESET}${DIM} ${t("closeShort")}${RESET}`
+    ? `${cText()}↑/↓${RESET}${DIM} ${folderMode ? t("folder") : t("instance")}${RESET}  ${cText()}Tab/→/⏎${RESET}${DIM} ${folderMode ? t("instance") : t("folder")}${RESET}  ${cText()}^T${RESET}${DIM} ${t("mode")}${RESET}  ${cText()}Esc${RESET}${DIM} ${t("closeShort")}${RESET}`
     : folderMode
-      ? `${fg(231)}↑/↓${RESET}${DIM} ${t("instance")}${RESET}  ${fg(231)}⏎${RESET}${DIM} ${t("startHere")}${RESET}  ${fg(231)}Tab/←${RESET}${DIM} ${t("folder")}${RESET}  ${fg(231)}^T${RESET}${DIM} ${t("mode")}${RESET}  ${fg(231)}Esc${RESET}`
-      : `${fg(231)}${t("type")}${RESET}${DIM} ${t("filter")}${RESET}  ${fg(231)}↑/↓${RESET}${DIM} ${t("folder")}${RESET}  ${fg(231)}→${RESET}${DIM} ${t("adoptShort")}${RESET}  ${fg(231)}⏎${RESET}${DIM} ${t("start")}${RESET}  ${fg(231)}Tab/←${RESET}${DIM} ${t("instance")}${RESET}  ${fg(231)}Esc${RESET}`;
-  box.push(B("├") + `${fg(accent)}${"─".repeat(innerW)}${RESET}` + B("┤"));
+      ? `${cText()}↑/↓${RESET}${DIM} ${t("instance")}${RESET}  ${cText()}⏎${RESET}${DIM} ${t("startHere")}${RESET}  ${cText()}Tab/←${RESET}${DIM} ${t("folder")}${RESET}  ${cText()}^T${RESET}${DIM} ${t("mode")}${RESET}  ${cText()}Esc${RESET}`
+      : `${cText()}${t("type")}${RESET}${DIM} ${t("filter")}${RESET}  ${cText()}↑/↓${RESET}${DIM} ${t("folder")}${RESET}  ${cText()}→${RESET}${DIM} ${t("adoptShort")}${RESET}  ${cText()}⏎${RESET}${DIM} ${t("start")}${RESET}  ${cText()}Tab/←${RESET}${DIM} ${t("instance")}${RESET}  ${cText()}Esc${RESET}`;
+  box.push(B("├") + `${c(accent)}${"─".repeat(innerW)}${RESET}` + B("┤"));
   box.push(B("│") + " " + pad(hint, textW) + " " + B("│"));
-  box.push(B("╰") + `${fg(accent)}${"─".repeat(innerW)}${RESET}` + B("╯"));
+  box.push(B("╰") + `${c(accent)}${"─".repeat(innerW)}${RESET}` + B("╯"));
 
+  const top = Math.max(2, Math.floor((height - box.length) / 2));
+  const left = Math.max(0, Math.floor((W - popupW) / 2));
+  return overlayBox(backdrop, surfaceBox(box, TH().raised), top, left);
+}
+
+/** Compact human byte size. */
+function sizeFmt(n: number): string {
+  if (n < 1024) return `${n}B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)}K`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)}M`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(1)}G`;
+}
+
+/** One-line governor bar: PSS usage vs the RAM ceiling, heat-coloured. */
+function governorBar(snap: RemoteSnapshot, w: number): string {
+  const th = TH();
+  const g = snap.governor;
+  const pct = g.ceilingMb ? g.usedMb / g.ceilingMb : 0;
+  const col = heat(pct, th.success, th.warning, th.error);
+  const tag = ` ${tfg(col)}${BOLD}${g.usedMb}${RESET}${cText3()}/${g.ceilingMb}MB${RESET}  ${cText3()}${snap.servers.length} srv · ~${g.roomForSessions} more${RESET}${g.overCeiling ? `  ${cErr()}${ICONS.fail} OOM${RESET}` : g.overWarn ? `  ${cWarn()}!${RESET}` : ""}`;
+  const barW = Math.max(8, w - 4 - vwidth(tag));
+  return `${cText3()}RAM${RESET} ${meter(pct, barW, col, th.textDim)}${tag}`;
+}
+
+/**
+ * The multi-host Commander (`h`). Ebene 0 lists the network neighbourhood (every
+ * SSH/Tailscale/manual host + the local machine); entering a host opens Ebene 1,
+ * a file browser over SSH/SFTP with shell-out and per-project remote-control
+ * control. Pure render — async listings/snapshots are fetched in index.ts and
+ * parked on ui (cmdEntries / cmdRemote), mirroring the issue-flow pattern.
+ */
+function renderCommander(
+  states: InstanceState[], frame: number, now: number, W: number, height: number, ui: UIState,
+): string[] {
+  const th = TH();
+  const innerW = W - 2;
+  const textW = innerW - 2;
+  const title = `${BOLD}${cAcc()}${ICONS.host} COMMANDER${RESET}`;
+
+  // ── Ebene 0: hosts ──
+  if (ui.cmdLevel === "hosts") {
+    const hosts = ui.cmdHosts;
+    const sel = clampIdx(ui.cmdHostSel, hosts.length);
+    ui.cmdHostSel = sel;
+    const cells = hosts.map((h, i) => {
+      const on = i === sel;
+      const mark = on ? `${cText()}${ICONS.cursor}${RESET}` : " ";
+      const dot = h.online === false ? `${cText3()}${ICONS.idle}${RESET}`
+        : h.online ? `${cOk()}${ICONS.active}${RESET}` : `${cDim()}${ICONS.tool}${RESET}`;
+      const name = on ? `${BOLD}${cText()}${h.name}${RESET}` : `${cText2()}${h.name}${RESET}`;
+      const left = `${mark} ${dot} ${cAcc()}${ICONS.host}${RESET} ${name}`;
+      const right = `${cText3()}${sshTarget(h)}${RESET}  ${cDim()}${h.source}${h.os ? " · " + h.os : ""}${RESET}`;
+      return spread(left, right, textW);
+    });
+    const out: string[] = [rule(`${title} `, ` ${cText3()}${t("cmdNetwork")} · ${hosts.length}${RESET} `, W, "━", th.textDim), ""];
+    const cap = Math.max(3, height - 6);
+    const { slice, start } = windowAround(cells, sel, cap);
+    const body = ["", ...slice.map((c, i) => {
+      if (i === 0 && start > 0) return `${DIM}  ↑ ${start} ${t("more")}${RESET}`;
+      if (i === slice.length - 1 && start + cap < cells.length) return `${DIM}  ↓ ${cells.length - start - cap} ${t("more")}${RESET}`;
+      return c;
+    }), ""];
+    for (const l of panel(`${cAcc()}${ICONS.host}${RESET} ${t("cmdHosts")}`, "", body, innerW, th.raised, th.accent)) out.push(l);
+    out.push("");
+    out.push(`${cText()}↑/↓${RESET}${DIM} ${t("select")}${RESET}  ${cText()}→/⏎${RESET}${DIM} ${t("cmdEnterHost")}${RESET}  ${cText()}Esc${RESET}${DIM} ${t("back")}${RESET}  ${DIM}[q] ${t("quit")}${RESET}`);
+    return out;
+  }
+
+  // ── Ebene 1: two side-by-side file panes (the literal Commander) ──
+  const active = ui.cmdPanes[ui.cmdActive];
+  const out: string[] = [rule(`${title} `, ` ${cText3()}${t("cmdTwoPane")}${RESET} `, W, "━", th.textDim), ""];
+  const boxW = Math.floor((W - 1) / 2); // two boxes + a 1-col gutter span W
+  const pInner = boxW - 2; // panel content width (between the │ borders + the corners)
+  const bodyRows = Math.max(4, height - 8); // shared height so both boxes line up
+
+  const renderPane = (p: CmdPane, idx: number): string[] => {
+    const isActive = idx === ui.cmdActive;
+    const accent = isActive ? th.accent : undefined; // active pane = accent border
+    const hostLbl = p.host || `(${t("cmdPickHost")})`;
+    const label = `${isActive ? cAcc() : cText3()}${ICONS.host} ${trunc(hostLbl, pInner - 4)}${RESET}`;
+    let content: string[];
+    if (!p.host) content = ["", `  ${cText3()}${ICONS.prompt} ${t("cmdPickHost")}${RESET}`];
+    else if (p.loading) content = [`${cText3()}${pathCol(p.path, pInner - 2)}${RESET}`, "", `  ${cText3()}${SPINNER[frame % SPINNER.length]} ${t("cmdLoading")}${RESET}`];
+    else if (p.error) content = ["", ...wrap(p.error, pInner - 4, 4).map((l) => `  ${cErr()}${l}${RESET}`)];
+    else {
+      const list: FsEntry[] = [{ name: "..", type: "dir", size: 0, mtime: 0 }, ...p.entries];
+      const sel = clampIdx(p.sel, list.length);
+      const cells = list.map((e, i) => {
+        const on = isActive && i === sel;
+        const mark = on ? `${cText()}${ICONS.cursor}${RESET}` : " ";
+        const icon = e.type === "dir" ? `${cAcc()}${ICONS.folder}${RESET}`
+          : e.type === "link" ? `${cText3()}${ICONS.branch}${RESET}` : `${cText3()}${ICONS.file}${RESET}`;
+        const nm = on ? `${BOLD}${cText()}${e.name}${RESET}` : e.type === "dir" ? `${cText2()}${e.name}${RESET}` : `${cText3()}${e.name}${RESET}`;
+        const meta = e.name === ".." ? "" : `${cDim()}${e.type === "dir" ? "" : sizeFmt(e.size)}${RESET}`;
+        return spread(`${mark} ${icon} ${nm}`, meta, pInner - 2);
+      });
+      const cap = Math.max(1, bodyRows - 1);
+      const { slice, start } = windowAround(cells, isActive ? sel : 0, cap);
+      content = [`${cText3()}${pathCol(p.path, pInner - 2)}${RESET}`, ...slice.map((c, i) => {
+        if (i === 0 && start > 0) return `${DIM}  ↑ ${start}${RESET}`;
+        if (i === slice.length - 1 && start + cap < cells.length) return `${DIM}  ↓ ${cells.length - start - cap}${RESET}`;
+        return c;
+      })];
+    }
+    while (content.length < bodyRows) content.push("");
+    return panel(label, "", content.slice(0, bodyRows), pInner, th.raised, accent);
+  };
+
+  const left = renderPane(ui.cmdPanes[0], 0);
+  const right = renderPane(ui.cmdPanes[1], 1);
+  const rows = Math.max(left.length, right.length);
+  for (let i = 0; i < rows; i++) out.push((left[i] ?? "") + " " + (right[i] ?? ""));
+
+  if (ui.cmdFeedback) out.push(`  ${cAccHi()}${trunc(ui.cmdFeedback, W - 4)}${RESET}`);
+  if (ui.cmdRemote) out.push(governorBar(ui.cmdRemote, W)); // active pane's host
+  out.push(
+    `${cText()}↑/↓${RESET}${DIM} ${t("select")}${RESET}  ${cText()}→/⏎${RESET}${DIM} ${t("cmdOpenDir")}${RESET}  ${cText()}←${RESET}${DIM} ${t("cmdUp")}${RESET}  ` +
+    `${cText()}Tab${RESET}${DIM} ${t("cmdSwitch")}${RESET}  ${cText()}[c]${RESET}${DIM} ${t("cmdCopy")}→${RESET}  ` +
+    `${cText()}[s]${RESET}${DIM} ${t("cmdShell")}${RESET}  ${cText()}[L]${RESET}${DIM} ${t("cmdLaunchRc")}${RESET}  ${cText()}[K]${RESET}${DIM} ${t("cmdKill")}${RESET}  ${cText()}[a]${RESET}${DIM} ${t("cmdAttach")}${RESET}  ${cText()}Esc${RESET}${DIM} ${t("cmdHostsBack")}${RESET}`,
+  );
+  return out;
+}
+
+/**
+ * Live theme quick-picker (the `p` overlay). Scrubbing the list previews the
+ * theme immediately — the backdrop and the popup itself re-skin as you move — so
+ * the choice is made by eye. Each row carries a swatch in its own accent shades.
+ */
+function renderThemePicker(
+  states: InstanceState[], frame: number, now: number, W: number, height: number, ui: UIState,
+  registry?: AgentRegistry,
+): string[] {
+  const backdrop = renderGrid(states, frame, now, W, ui, height, registry);
+  const th = TH();
+  const popupW = Math.min(W - 6, 52);
+  const innerW = popupW - 2;
+  const textW = innerW - 2;
+  const sel = clampIdx(ui.themeSel, THEMES.length);
+  const rows = THEMES.map((tm, i) => {
+    const on = i === sel;
+    const mark = on ? `${cText()}${ICONS.cursor}${RESET}` : " ";
+    const live = tm.name === th.name ? `${cOk()} ${ICONS.ok}${RESET}` : "";
+    const name = on ? `${BOLD}${cText()}${tm.label}${RESET}` : `${cText2()}${tm.label}${RESET}`;
+    const swatch = `${tfg(tm.accent)}███${RESET}${tfg(tm.accentHi)}██${RESET}${tfg(tm.success)}█${RESET}${tfg(tm.warning)}█${RESET}${tfg(tm.error)}█${RESET}`;
+    return spread(`${mark} ${name}${live}`, swatch, textW);
+  });
+  const title = `${cAcc()}${BOLD}${ICONS.context} ${t("themeTitle")}${RESET}`;
+  const content = ["", ...rows, "", `${DIM}${t("themeHint")}${RESET}`];
+  const box = panel(title, "", content, innerW, th.raised, th.accent);
   const top = Math.max(2, Math.floor((height - box.length) / 2));
   const left = Math.max(0, Math.floor((W - popupW) / 2));
   return overlayBox(backdrop, box, top, left);
@@ -1254,40 +1517,36 @@ function renderPicker(
 ): string[] {
   const out = headerLines(states, frame, now, W);
   const def = states.find((s) => s.def.key === ui.pickerInstance)?.def;
-  const accent = def?.color ?? 45;
+  const accent = def ? instColor(def.key) : TH().accent;
   const innerW = W - 2;
   const textW = innerW - 2;
   const recents = recentCwds(states, ui.pickerInstance);
   const sugg = dirSuggestions(ui.pickerInput, recents);
   const valid = isDir(ui.pickerInput);
-  const B = (ch: string) => `${fg(accent)}${ch}${RESET}`;
 
-  const title = `${fg(accent)}${BOLD}📂 ${t("workingFolder")}${RESET} ${DIM}· Agent → ${def?.key ?? ""} ${def?.label ?? ""}${RESET}`;
-  out.push(B("╭") + rule(` ${title} `, "", innerW, "─", accent) + B("╮"));
-
-  const caret = Math.floor(frame / 3) % 2 === 0 ? `${fg(231)}▏${RESET}` : " ";
-  const pcol = valid ? fg(252) : fg(196);
-  out.push(B("│") + " " + pad(`${fg(46)}❯${RESET} ${pcol}${ui.pickerInput}${RESET}${caret}`, textW) + " " + B("│"));
-  out.push(B("│") + " " + pad(valid ? `${DIM}✓ ${t("folderExists")}${RESET}` : `${fg(196)}✗ ${t("folderMissing")}${RESET}`, textW) + " " + B("│"));
-  out.push(B("│") + " " + pad(`${DIM}${recents.length ? t("recentFirst") : t("typePath")}${RESET}`, textW) + " " + B("│"));
+  const title = `${c(accent)}${BOLD}${ICONS.folder} ${t("workingFolder")}${RESET} ${DIM}· Agent → ${def?.key ?? ""} ${def?.label ?? ""}${RESET}`;
+  const caret = Math.floor(frame / 3) % 2 === 0 ? `${cText()}▏${RESET}` : " ";
+  const pcol = valid ? cText2() : cErr();
+  const content: string[] = [
+    `${cOk()}${ICONS.prompt}${RESET} ${pcol}${ui.pickerInput}${RESET}${caret}`,
+    valid ? `${cOk()}${ICONS.ok} ${t("folderExists")}${RESET}` : `${cErr()}${ICONS.fail} ${t("folderMissing")}${RESET}`,
+    `${DIM}${recents.length ? t("recentFirst") : t("typePath")}${RESET}`,
+  ];
 
   const sel = Math.min(Math.max(0, ui.pickerSel), Math.max(0, sugg.length - 1));
   ui.pickerSel = sel;
-  const room = Math.max(3, height - out.length - 4);
-  if (!sugg.length) {
-    out.push(B("│") + " " + pad(`${DIM}${t("noSuggestions")}${RESET}`, textW) + " " + B("│"));
-  }
+  const room = Math.max(3, height - 8);
+  if (!sugg.length) content.push(`${DIM}${t("noSuggestions")}${RESET}`);
   for (const [i, s] of sugg.slice(0, room).entries()) {
     const on = i === sel;
-    const mark = on ? `${fg(231)}▶${RESET}` : " ";
-    const line = on ? `${mark} ${BOLD}${tilde(s)}${RESET}` : `${mark} ${tilde(s)}`;
-    out.push(B("│") + " " + pad(line, textW) + " " + B("│"));
+    const mark = on ? `${cText()}${ICONS.cursor}${RESET}` : " ";
+    content.push(on ? `${mark} ${BOLD}${tilde(s)}${RESET}` : `${mark} ${tilde(s)}`);
   }
-  out.push(B("╰") + `${fg(accent)}${"─".repeat(innerW)}${RESET}` + B("╯"));
+  for (const l of panel(title, "", content, innerW, TH().raised, accent)) out.push(l);
   out.push("");
   out.push(
-    `${fg(231)}↑/↓${RESET}${DIM} ${t("select")}${RESET}  ${fg(231)}Tab/→${RESET}${DIM} ${t("takeover")}${RESET}  ` +
-    `${fg(231)}⏎${RESET}${DIM} ${t("startHere")}${RESET}  ${fg(231)}Esc${RESET}${DIM} ${t("cancel")}${RESET}`,
+    `${cText()}↑/↓${RESET}${DIM} ${t("select")}${RESET}  ${cText()}Tab/→${RESET}${DIM} ${t("takeover")}${RESET}  ` +
+    `${cText()}⏎${RESET}${DIM} ${t("startHere")}${RESET}  ${cText()}Esc${RESET}${DIM} ${t("cancel")}${RESET}`,
   );
   return out;
 }
@@ -1304,7 +1563,7 @@ const BANNER = [
 
 /** First-run / zero-account screen: pink wordmark + how to get going. */
 function renderEmpty(W: number, height: number): string[] {
-  const pink = rgb(244, 114, 182);
+  const pink = tfg(TH().accent);
   const out: string[] = ["", "", ""];
   const bw = Math.max(...BANNER.map(vwidth));
   const margin = " ".repeat(Math.max(0, Math.floor((W - bw) / 2)));
@@ -1312,13 +1571,13 @@ function renderEmpty(W: number, height: number): string[] {
   out.push("");
   out.push(center(`${DIM}one terminal · every Claude · multiplexed${RESET}`, W));
   out.push("");
-  out.push(center(`${fg(252)}No Claude Code accounts found on this machine.${RESET}`, W));
-  out.push(center(`${DIM}Install Claude Code and sign in with ${RESET}${fg(45)}claude${RESET}${DIM}, then press ${RESET}${fg(231)}r${RESET}${DIM}.${RESET}`, W));
+  out.push(center(`${cText2()}No Claude Code accounts found on this machine.${RESET}`, W));
+  out.push(center(`${DIM}Install Claude Code and sign in with ${RESET}${cAcc()}claude${RESET}${DIM}, then press ${RESET}${cText()}r${RESET}${DIM}.${RESET}`, W));
   out.push("");
-  out.push(center(`${DIM}Running several accounts? Give each its own ${RESET}${fg(45)}CLAUDE_CONFIG_DIR${RESET}${DIM} (e.g. ~/.claude-work).${RESET}`, W));
-  out.push(center(`${DIM}Claudeplex auto-discovers every ${RESET}${fg(45)}~/.claude*${RESET}${DIM} config dir.${RESET}`, W));
+  out.push(center(`${DIM}Running several accounts? Give each its own ${RESET}${cAcc()}CLAUDE_CONFIG_DIR${RESET}${DIM} (e.g. ~/.claude-work).${RESET}`, W));
+  out.push(center(`${DIM}Claudeplex auto-discovers every ${RESET}${cAcc()}~/.claude*${RESET}${DIM} config dir.${RESET}`, W));
   out.push("");
-  out.push(center(`${fg(231)}[r]${RESET}${DIM} rescan${RESET}   ${fg(231)}[q]${RESET}${DIM} quit${RESET}`, W));
+  out.push(center(`${cText()}[r]${RESET}${DIM} rescan${RESET}   ${cText()}[q]${RESET}${DIM} quit${RESET}`, W));
   while (out.length < height - 1) out.push("");
   return out;
 }
@@ -1328,22 +1587,33 @@ export function render(
   registry?: AgentRegistry,
 ): string[] {
   const W = Math.max(MIN_CARD + 4, width - 2); // reserve a right gutter so cards never overflow
-  if (!states.length) return renderEmpty(W, height).map((l) => trunc(l, W));
+  const th = getTheme();
+  // grey-ramp shade per instance, set once per frame and keyed by instance id
+  shadeMap = new Map(states.map((s, i) => [s.def.key, instanceShade(i, states.length)]));
+  const onPage = (lines: string[]): string[] =>
+    lines.map((l, i) => pageWrap(trunc(l, W), gradientRow(th.page, i, height)));
+  // the Commander browses remote hosts and needs no local accounts
+  if (!states.length && !ui?.commander) return onPage(renderEmpty(W, height));
   const state: UIState = ui ?? {
     sel: -1, expanded: false, sessSel: 0, transcript: false, scroll: 0,
     cockpit: false, focus: "", input: "", cockpitArea: "input", listSel: 0, pendingImages: [],
     picker: "", pickerInput: "", pickerSel: 0, pickerInstance: "", pickerPane: "instance", pickerInstSel: 0,
     pickerMode: "instance", gridRegion: "cards", collapsed: { cards: false, live: false, questions: false }, closeArm: "", renaming: "",
+    themePicker: false, themeSel: 0,
+    commander: false, cmdLevel: "hosts", cmdHosts: [], cmdHostSel: 0, cmdActive: 0,
+    cmdPanes: [emptyPane(), emptyPane()], cmdRemote: null, cmdFeedback: "",
     issueStage: "pick", issuePane: "folder", issueFolderSel: 0, issueInput: "", issueFeedback: "",
     issueDraft: "", issueScroll: 0, issueRepo: "", issueInstance: "", issueUrl: "", issueError: "",
   };
   let out: string[];
-  if (state.picker === "issue") out = renderIssueModal(states, registry, frame, now, W, height, state);
+  if (state.commander) out = renderCommander(states, frame, now, W, height, state);
+  else if (state.themePicker) out = renderThemePicker(states, frame, now, W, height, state, registry);
+  else if (state.picker === "issue") out = renderIssueModal(states, registry, frame, now, W, height, state);
   else if (state.picker === "wizard") out = renderWizard(states, registry, frame, now, W, height, state);
   else if (state.picker === "cwd") out = renderPicker(states, frame, now, W, height, state);
   else if (state.cockpit && registry) out = renderCockpit(states, registry, frame, now, W, height, state);
   else if (state.expanded && state.transcript) out = renderTranscript(states, frame, now, W, height, state);
   else if (state.expanded) out = renderDetail(states, frame, now, W, state);
   else out = renderGrid(states, frame, now, W, state, height, registry);
-  return out.map((l) => trunc(l, W));
+  return onPage(out);
 }

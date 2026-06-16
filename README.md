@@ -37,8 +37,11 @@ your machine — see [Security &amp; privacy](#security--privacy).
 - 🚀 **New-agent wizard** — a popup to launch a fresh agent: pick an account (by spare capacity) → pick a working folder, or flip it the other way (folder → account). Spans your full project history.
 - 🎛️ **Agent cockpit** — message agents directly, attach clipboard images, restart, kill, and take over sessions that are waiting on you.
 - 🔎 **Auto-discovery** — finds every Claude account on the machine. No shell aliases needed.
+- 🧭 **Multi-host Commander** — browse every SSH/Tailscale host as a network neighbourhood, navigate remote filesystems over SFTP, copy files host↔host without scp, and shell-out into a real remote PTY (`h`).
+- 🛰️ **Remote-control fleet** — launch persistent `claude remote-control` servers (in tmux, so they survive the lid closing) that serve both the TUI and the Claude mobile app, governed by a RAM ceiling so they never OOM the box.
+- 🎨 **Lumen themes** — 6 truecolor themes with light-from-above gradient surfaces, switchable live (`p`).
 - 🌍 **Bilingual UI** — English / German, auto-detected from `$LANG`, toggle live.
-- 🧩 **Scriptable** — `--json` emits a machine-readable snapshot of all accounts/usage/sessions.
+- 🧩 **Scriptable** — `--json` emits a machine-readable snapshot: `{ accounts, remote }` (accounts/usage/sessions + the remote-control fleet and governor).
 
 ## Requirements
 
@@ -158,8 +161,15 @@ effect on the next launch (or press `r` to rescan).
 | `n` | **new-agent wizard** (popup) |
 | `N` | quick-launch an agent on the selected account |
 | `A` | start an agent on every account |
+| `h` | open the multi-host **Commander** |
+| `p` | open the live **theme picker** |
+| `i` | quick-issue (draft + file a GitHub issue) |
 | `L` | toggle language (EN/DE) |
 | `r` / `q` | rescan / quit |
+
+**Commander (`h`)** — a multi-host file & control cockpit. Ebene 0 lists every host (your `~/.ssh/config`, live Tailscale peers, a manual list, plus the local machine). Pick a host to open Ebene 1: a **two-pane** SSH/SFTP file browser. `↑/↓` select · `→`/`⏎` open dir · `←` up · `Tab` switch the active pane · `c` **copy** the selected file/dir into the *other* pane's directory — host↔host, scp without the scp · `s` **shell-out** into a real PTY in that dir (replaces the iTerm SSH-tab dance) · `L` launch a `claude remote-control` server there (local **or** remote host) · `K` stop it · `a` attach into the live server · `Esc` re-pick the pane's host. A RAM bar shows that host's remote-control fleet against the governor ceiling, with a calibrated "~N more sessions fit" estimate.
+
+**Theme picker (`p`)** — 6 live themes (Lume Atelier · Petrol · Lagoon · Monochrome · Tokyo Night · Catppuccin). `↑/↓` previews instantly, `⏎` applies + persists, `Esc` restores.
 
 **New-agent wizard** — `↑/↓` move · `Tab` `→` next pane · `←` back · `^T` flip orientation (account↔folder) · `⏎` launch · `Esc` cancel
 
@@ -181,6 +191,12 @@ effect on the next launch (or press `r` to rescan).
 | `CD_NOTIFY` | off | set to enable a macOS notification when a session finishes its turn |
 | `CD_NO_FULLSCREEN` | off | set to skip forcing the terminal window fullscreen |
 | `CD_LANG` | auto | force UI language (`en` / `de`); otherwise detected from `$LANG` |
+| `CD_THEME` | `atelier` | force a theme (`atelier`/`petrol`/`lagoon`/`mono`/`tokyo`/`catppuccin`); otherwise the persisted picker choice |
+| `CD_RC_RAM_CEILING_MB` | `16384` | global RAM ceiling (MB) for the remote-control fleet governor |
+| `CD_RC_RAM_WARN` | `0.8` | warn when fleet PSS reaches this fraction of the ceiling |
+| `CD_RC_SERVER_MB` | `142` | calibrated per-server RAM estimate (devhost, Max-20x) |
+| `CD_RC_SESSION_MB` | `330` | calibrated per-session RAM estimate (incl. ~32% MCP) — drives the "~N more sessions" headroom |
+| `CD_RC_GOVERN` | off | set to `1` to let the governor reap idle sessions / empty servers before OOM (default: observe + warn only) |
 
 ## Scripting
 

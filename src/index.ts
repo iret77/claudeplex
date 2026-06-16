@@ -2,7 +2,7 @@
 import { collectAll, dismissSession, instanceFolders, type InstanceState } from "./collect.ts";
 import {
   render, recentCwds, waitingSessions, closeableSessions, cockpitTabs,
-  wizardFolders, wizardOrderedInstances, issueRepos, type UIState,
+  wizardFolders, wizardOrderedInstances, issueRepos, emptyPane, type UIState,
 } from "./render.ts";
 import { updateStates, type Transition } from "./tracker.ts";
 import { AgentRegistry } from "./agents.ts";
@@ -11,6 +11,10 @@ import { discoverInstances } from "./discover.ts";
 import { dirSuggestions, expandTilde, isDir } from "./paths.ts";
 import { readClipboardImage } from "./clipboard.ts";
 import { loadLocale, toggleLocale, t, stateLabel } from "./i18n.ts";
+import { loadTheme, previewTheme, setTheme, themeIndex, getTheme, THEMES } from "./theme.ts";
+import { remoteSnapshot, launchRcServer, stopRcServer, fetchRemoteFleet, tmuxName } from "./remote.ts";
+import { discoverHosts, isLocal, type Host } from "./hosts.ts";
+import { listDir, resolveHome, pathJoin, shellOutArgv, copyEntry } from "./ssh.ts";
 import { pickFreeInstance, draftIssue, createIssue, splitDraft, isError } from "./issue.ts";
 
 /** Put the host terminal window into native macOS fullscreen (best-effort). */
@@ -62,9 +66,11 @@ function termWidth(): number {
 }
 
 async function runJson(): Promise<void> {
-  const states = collectAll(discoverInstances());
+  const instances = discoverInstances();
+  const states = collectAll(instances);
+  const remote = remoteSnapshot(instances);
   // strip noisy fields, keep the useful summary
-  const out = states.map((s) => ({
+  const accounts = states.map((s) => ({
     key: s.def.key,
     label: s.def.label,
     account: s.account,
@@ -82,7 +88,8 @@ async function runJson(): Promise<void> {
     usageToday: { workTokens: s.today.work, messages: s.today.messages, cost: s.today.cost },
     usageWeek: { workTokens: s.week.work, messages: s.week.messages, cost: s.week.cost },
   }));
-  process.stdout.write(JSON.stringify(out, null, 2) + "\n");
+  // Multi-host clients consume this over `ssh <host> claudeplex --json`.
+  process.stdout.write(JSON.stringify({ accounts, remote }, null, 2) + "\n");
 }
 
 function runOnce(): void {
@@ -102,11 +109,15 @@ function runLoop(): void {
     cockpit: false, focus: "", input: "", cockpitArea: "input", listSel: 0, pendingImages: [],
     picker: "", pickerInput: "", pickerSel: 0, pickerInstance: "", pickerPane: "instance", pickerInstSel: 0,
     pickerMode: "instance", gridRegion: "cards", collapsed: { cards: false, live: false, questions: false }, closeArm: "", renaming: "",
+    themePicker: false, themeSel: 0,
+    commander: false, cmdLevel: "hosts", cmdHosts: [], cmdHostSel: 0, cmdActive: 0,
+    cmdPanes: [emptyPane(), emptyPane()], cmdRemote: null, cmdFeedback: "",
     issueStage: "pick", issuePane: "folder", issueFolderSel: 0, issueInput: "", issueFeedback: "",
     issueDraft: "", issueScroll: 0, issueRepo: "", issueInstance: "", issueUrl: "", issueError: "",
   };
   const registry = new AgentRegistry();
   let issueToken = 0; // bumped on each draft/create/open to ignore stale async results
+  let themeOrig = ""; // theme name to restore if the picker is cancelled
 
 
   /** Default cwd for a new agent: the instance's most recent session, else $HOME. */
@@ -221,6 +232,78 @@ function runLoop(): void {
     });
   };
 
+  // ── Commander (multi-host) ──
+  const cmdTokens = [0, 0]; // per-pane stale-async guards
+
+  /** Open the Commander; resolve the host list once. Return to files if a pane is set. */
+  const openCommander = (): void => {
+    ui.commander = true;
+    ui.cmdHosts = discoverHosts();
+    ui.cmdHostSel = 0;
+    ui.cmdFeedback = "";
+    ui.cmdLevel = ui.cmdPanes.some((p) => p.host) ? "files" : "hosts";
+  };
+
+  /** The Host object backing a pane. */
+  const cmdHostOf = (p: { host: string }): Host | undefined => ui.cmdHosts.find((h) => h.name === p.host);
+
+  /** Refresh the fleet/governor for the active host: local = live snapshot, remote = ssh --json. */
+  const refreshFleet = (host: Host): void => {
+    if (isLocal(host)) {
+      ui.cmdRemote = remoteSnapshot(instances);
+      return;
+    }
+    void fetchRemoteFleet(host).then((snap) => {
+      const active = ui.cmdPanes[ui.cmdActive];
+      if (ui.commander && active.host === host.name) {
+        ui.cmdRemote = snap;
+        draw();
+      }
+    });
+  };
+
+  /** Fetch (async) the listing of `path` on a host into pane `idx`; ignores stale results. */
+  const fetchListing = (idx: number, host: Host, path: string): void => {
+    const p = ui.cmdPanes[idx];
+    p.loading = true;
+    p.error = "";
+    p.path = path;
+    p.sel = 0;
+    if (idx === ui.cmdActive) refreshFleet(host);
+    const token = ++cmdTokens[idx];
+    void listDir(host, path).then(
+      (entries) => {
+        if (token !== cmdTokens[idx] || !ui.commander) return;
+        p.entries = entries;
+        p.loading = false;
+        draw();
+      },
+      (e) => {
+        if (token !== cmdTokens[idx] || !ui.commander) return;
+        p.entries = [];
+        p.loading = false;
+        p.error = String(e?.message ?? e);
+        draw();
+      },
+    );
+  };
+
+  /** Enter a host into the ACTIVE pane: resolve its home (absolute), then list it. */
+  const enterHost = (h: Host): void => {
+    const idx = ui.cmdActive;
+    const p = ui.cmdPanes[idx];
+    p.host = h.name;
+    p.entries = [];
+    p.loading = true;
+    ui.cmdLevel = "files";
+    ui.cmdFeedback = "";
+    const token = ++cmdTokens[idx];
+    void resolveHome(h).then((home) => {
+      if (token !== cmdTokens[idx] || !ui.commander) return;
+      fetchListing(idx, h, home);
+    });
+  };
+
   const doRefresh = (t: number) => {
     states = collectAll(instances, t);
     lastRefresh = t;
@@ -261,10 +344,137 @@ function runLoop(): void {
       const PGDN = k === "\x1b[6~";
       const page = Math.max(1, (process.stdout.rows || 40) - 8);
 
-      // No accounts discovered → only quit / rescan are meaningful (empty state).
-      if (states.length === 0) {
+      // No accounts discovered → quit / rescan / open the Commander (which can
+      // browse remote hosts even with no local accounts).
+      if (states.length === 0 && !ui.commander) {
         if (k === "q" || k === "\x03") return quit();
         if (k === "r") doRefresh(Date.now());
+        if (k === "h") { openCommander(); return draw(); }
+        return draw();
+      }
+
+      // Live theme picker: ↑/↓ previews, ⏎ commits + persists, Esc restores.
+      if (ui.themePicker) {
+        if (k === "\x03") return quit();
+        if (ESC) {
+          previewTheme(themeOrig);
+          ui.themePicker = false;
+        } else if (ENTER) {
+          setTheme(THEMES[Math.min(ui.themeSel, THEMES.length - 1)].name);
+          ui.themePicker = false;
+        } else if (UP) {
+          ui.themeSel = (ui.themeSel - 1 + THEMES.length) % THEMES.length;
+          previewTheme(THEMES[ui.themeSel].name);
+        } else if (DOWN) {
+          ui.themeSel = (ui.themeSel + 1) % THEMES.length;
+          previewTheme(THEMES[ui.themeSel].name);
+        } else {
+          return;
+        }
+        return draw();
+      }
+
+      // Commander: Ebene 0 hosts → Ebene 1 two-pane files (copy/shell-out/RC control).
+      if (ui.commander) {
+        if (k === "\x03") return quit();
+        if (ui.cmdLevel === "hosts") {
+          const hosts = ui.cmdHosts;
+          if (ESC) {
+            if (ui.cmdPanes.some((p) => p.host)) ui.cmdLevel = "files"; // a pane is set → back
+            else ui.commander = false;
+          } else if (UP) ui.cmdHostSel = Math.max(0, ui.cmdHostSel - 1);
+          else if (DOWN) ui.cmdHostSel = Math.min(Math.max(0, hosts.length - 1), ui.cmdHostSel + 1);
+          else if (ENTER || RIGHT) {
+            const h = hosts[Math.min(ui.cmdHostSel, Math.max(0, hosts.length - 1))];
+            if (h) enterHost(h);
+          } else return;
+          return draw();
+        }
+        // files level — operate on the ACTIVE pane
+        const ai = ui.cmdActive;
+        const p = ui.cmdPanes[ai];
+        const other = ui.cmdPanes[ai === 0 ? 1 : 0];
+        const host = cmdHostOf(p);
+        const rcOpts = () => {
+          const local = host ? isLocal(host) : false;
+          const def = local ? instances[ui.sel] ?? instances[0] : undefined;
+          return { key: def?.key ?? "default", configDir: def?.configDir, isDefault: def?.isDefault };
+        };
+        const count = p.entries.length + 1; // +1 for the ".." row
+        const sel = Math.min(Math.max(0, p.sel), count - 1);
+        if (ESC) {
+          ui.cmdLevel = "hosts"; // re-pick the active pane's host
+          ui.cmdFeedback = "";
+        } else if (k === "\t") {
+          ui.cmdActive = ai === 0 ? 1 : 0;
+          ui.cmdFeedback = "";
+          const np = ui.cmdPanes[ui.cmdActive];
+          const nh = cmdHostOf(np);
+          if (np.host && nh) refreshFleet(nh);
+          else ui.cmdLevel = "hosts"; // empty pane → pick a host for it
+        } else if (UP) {
+          p.sel = Math.max(0, sel - 1);
+        } else if (DOWN) {
+          p.sel = Math.min(count - 1, sel + 1);
+        } else if (LEFT) {
+          if (host) fetchListing(ai, host, pathJoin(p.path, ".."));
+        } else if (ENTER || RIGHT) {
+          if (host) {
+            if (sel === 0) fetchListing(ai, host, pathJoin(p.path, ".."));
+            else {
+              const e = p.entries[sel - 1];
+              if (e && e.type === "dir") fetchListing(ai, host, pathJoin(p.path, e.name));
+            }
+          }
+        } else if (k === "c") {
+          // copy the active pane's selection → the OTHER pane's dir (host↔host, no scp)
+          const otherHost = cmdHostOf(other);
+          if (host && otherHost && other.host && sel > 0) {
+            const e = p.entries[sel - 1];
+            if (e) {
+              const srcPath = pathJoin(p.path, e.name);
+              const dstPath = other.path;
+              const oi = ai === 0 ? 1 : 0;
+              ui.cmdFeedback = t("cmdCopying");
+              void copyEntry({ host, path: srcPath }, { host: otherHost, path: dstPath }).then((r) => {
+                if (!ui.commander) return;
+                ui.cmdFeedback = r.ok ? `✓ ${e.name} → ${other.host}` : `error: ${r.error}`;
+                if (r.ok) fetchListing(oi, otherHost, dstPath); // refresh dest to show the copy
+                else draw();
+              });
+            }
+          } else if (!other.host) {
+            ui.cmdFeedback = `${t("cmdPickHost")} → ${t("cmdSwitch")} (Tab)`;
+          }
+        } else if (k === "s") {
+          if (host) shellOut(shellOutArgv(host, { cwd: p.path }));
+        } else if (k === "L") {
+          if (host) {
+            const cwd = p.path;
+            ui.cmdFeedback = t("cmdLaunching");
+            void launchRcServer(host, cwd, { spawn: "worktree", ...rcOpts() }).then((r) => {
+              if (!ui.commander) return;
+              ui.cmdFeedback = r.ok ? `${r.reused ? "running" : "✓ launched"} @ ${cwd}` : `error: ${r.error}`;
+              refreshFleet(host);
+              draw();
+            });
+          }
+        } else if (k === "K") {
+          if (host) {
+            const cwd = p.path;
+            ui.cmdFeedback = "stopping…";
+            void stopRcServer(host, rcOpts().key, cwd).then((ok) => {
+              if (!ui.commander) return;
+              ui.cmdFeedback = ok ? `✓ stopped @ ${cwd}` : "no server here";
+              refreshFleet(host);
+              draw();
+            });
+          }
+        } else if (k === "a") {
+          if (host) shellOut(shellOutArgv(host, { tmux: tmuxName(rcOpts().key, p.path) }));
+        } else {
+          return;
+        }
         return draw();
       }
 
@@ -693,6 +903,12 @@ function runLoop(): void {
           openWizard(); // 2-pane modal: instance (with load) | working-folder
         } else if (k === "i") {
           openIssue(); // quick-issue: pick repo + describe → draft on a free instance
+        } else if (k === "p") {
+          themeOrig = getTheme().name; // live theme picker (preview + persist)
+          ui.themeSel = themeIndex();
+          ui.themePicker = true;
+        } else if (k === "h") {
+          openCommander(); // multi-host Commander (hosts → files → control)
         } else if (k === "N") {
           openPicker(states[ui.sel].def); // quick-launch on the selected instance
         } else if (k === "A") {
@@ -729,11 +945,38 @@ function runLoop(): void {
     frame++;
   };
 
-  const timer = setInterval(draw, FRAME_MS);
+  let timer = setInterval(draw, FRAME_MS);
+
+  /**
+   * Shell-out: suspend the TUI, hand the terminal to a real interactive process
+   * (ssh -t / tmux attach / claude --resume), and re-enter cleanly on exit. This
+   * is what makes the Commander a full iTerm replacement.
+   */
+  const shellOut = (argv: string[]): void => {
+    clearInterval(timer);
+    process.stdout.write(leave); // show cursor, leave alt screen
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    process.stdin.pause();
+    try {
+      Bun.spawnSync(argv, { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+    } catch {
+      /* spawn failed — fall through to re-enter */
+    }
+    process.stdout.write(enter); // back to alt screen, hide cursor
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+    }
+    lastW = -1; // force a full clear on the next draw
+    timer = setInterval(draw, FRAME_MS);
+    draw();
+  };
+
   draw();
 }
 
 loadLocale(); // resolve locale once: CD_LANG env > persisted config > $LANG detect
+loadTheme(); // resolve theme once: CD_THEME env > persisted config > Atelier default
 
 if (args.has("--json")) {
   await runJson();

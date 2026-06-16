@@ -76,7 +76,7 @@ export class AgentRegistry {
   launch(def: InstanceDef, cwd: string): ManagedAgent {
     const desiredId = crypto.randomUUID();
     return this.spawn({
-      configDir: def.configDir, cwd, instanceKey: def.key,
+      configDir: def.configDir, cwd, instanceKey: def.key, isDefault: def.isDefault,
       desiredId, name: this.nameFor(def, cwd, desiredId),
     });
   }
@@ -86,7 +86,7 @@ export class AgentRegistry {
     // Do NOT set a generic --name here: claude's --name overwrites the real
     // session title. Only pass a name if the user explicitly renamed it.
     const name = this.names.get(sessionId);
-    return this.spawn({ configDir: def.configDir, cwd, instanceKey: def.key, resume: sessionId, name });
+    return this.spawn({ configDir: def.configDir, cwd, instanceKey: def.key, isDefault: def.isDefault, resume: sessionId, name });
   }
 
   /** One agent per instance. Skips instances that already have a live agent. */

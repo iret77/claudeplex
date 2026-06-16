@@ -13,6 +13,56 @@ export const fg = (c: number) => `\x1b[38;5;${c}m`;
 export const bg = (c: number) => `\x1b[48;5;${c}m`;
 export const rgb = (r: number, g: number, b: number) => `\x1b[38;2;${r};${g};${b}m`;
 
+/* ── Truecolor token plumbing (Lumen theme system) ───────────────────────────
+ * The theme layer (theme.ts) speaks in 24-bit RGB triples and surfaces (a
+ * top→bottom gradient pair). These low-level helpers stay theme-agnostic: they
+ * take concrete RGB values, so the same math serves every theme. */
+
+/** A 24-bit color as an [r,g,b] triple, each channel 0–255. */
+export type RGB = readonly [number, number, number];
+/** A color with alpha — flattened against a surface before it hits the wire. */
+export interface Alpha { rgb: RGB; a: number; }
+
+const clamp255 = (n: number) => (n < 0 ? 0 : n > 255 ? 255 : Math.round(n));
+
+/** Parse "#rrggbb" (or "rrggbb") into an RGB triple. */
+export function hex(s: string): RGB {
+  const h = s.replace(/^#/, "");
+  return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+}
+
+/** Linear blend between two colors; t=0 → a, t=1 → b. */
+export function lerp(a: RGB, b: RGB, t: number): RGB {
+  return [clamp255(a[0] + (b[0] - a[0]) * t), clamp255(a[1] + (b[1] - a[1]) * t), clamp255(a[2] + (b[2] - a[2]) * t)];
+}
+export const lighten = (c: RGB, amt: number): RGB => lerp(c, [255, 255, 255], amt);
+export const darken = (c: RGB, amt: number): RGB => lerp(c, [0, 0, 0], amt);
+
+/** Flatten an alpha color over an opaque backdrop into a concrete RGB. */
+export function flatten(over: RGB, c: Alpha): RGB {
+  return [
+    clamp255(c.rgb[0] * c.a + over[0] * (1 - c.a)),
+    clamp255(c.rgb[1] * c.a + over[1] * (1 - c.a)),
+    clamp255(c.rgb[2] * c.a + over[2] * (1 - c.a)),
+  ];
+}
+
+/** Truecolor foreground / background SGR from an RGB triple. */
+export const tfg = (c: RGB) => `\x1b[38;2;${c[0]};${c[1]};${c[2]}m`;
+export const tbg = (c: RGB) => `\x1b[48;2;${c[0]};${c[1]};${c[2]}m`;
+
+/** A surface is a vertical gradient: lighter at the top (light from above). */
+export interface Surface { top: RGB; btm: RGB; }
+/**
+ * Colour of surface row `i` of `n` (0 = top edge, n-1 = bottom). One-row
+ * surfaces collapse to the top colour. This is what gives boxes their
+ * "light from above" depth.
+ */
+export function gradientRow(s: Surface, i: number, n: number): RGB {
+  if (n <= 1) return s.top;
+  return lerp(s.top, s.btm, i / (n - 1));
+}
+
 const ANSI = /^\x1b\[[0-9;]*m/;
 
 /**
@@ -132,17 +182,17 @@ export function center(s: string, width: number): string {
  * A rule line: left segment + filler + right segment, filled to `width`
  * visible columns with `ch`.
  */
-export function rule(left: string, right: string, width: number, ch: string, color: number): string {
+export function rule(left: string, right: string, width: number, ch: string, color: RGB): string {
   const lw = vwidth(left);
   const rw = vwidth(right);
   const fill = Math.max(0, width - lw - rw);
-  return left + fg(color) + ch.repeat(fill) + RESET + right;
+  return left + tfg(color) + ch.repeat(fill) + RESET + right;
 }
 
 const EIGHTHS = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
 
-/** Smooth horizontal meter with fractional final cell. */
-export function meter(pct: number, width: number, color: number): string {
+/** Smooth horizontal meter with fractional final cell (truecolor fill + track). */
+export function meter(pct: number, width: number, fill: RGB, track: RGB): string {
   const p = Math.max(0, Math.min(1, pct));
   const exact = p * width;
   let full = Math.floor(exact);
@@ -151,23 +201,20 @@ export function meter(pct: number, width: number, color: number): string {
     full++;
     frac = 0;
   }
-  let s = fg(color) + "█".repeat(Math.min(full, width));
+  let s = tfg(fill) + "█".repeat(Math.min(full, width));
   let used = Math.min(full, width);
   if (used < width && frac > 0) {
     s += EIGHTHS[frac];
     used++;
   }
-  s += `${DIM}${fg(238)}${"░".repeat(Math.max(0, width - used))}${RESET}`;
+  s += `${tfg(track)}${"░".repeat(Math.max(0, width - used))}${RESET}`;
   return s;
 }
 
-/** Heat color for a 0..1 load ratio. */
-export function heat(pct: number): number {
-  if (pct >= 1) return 196; // red
-  if (pct >= 0.85) return 202; // orange-red
-  if (pct >= 0.6) return 214; // orange
-  if (pct >= 0.35) return 220; // yellow
-  return 46; // green
+/** Heat color for a 0..1 load ratio: ok → warn → err, blended in truecolor. */
+export function heat(pct: number, ok: RGB, warn: RGB, err: RGB): RGB {
+  const p = Math.max(0, Math.min(1, pct));
+  return p < 0.5 ? lerp(ok, warn, p / 0.5) : lerp(warn, err, (p - 0.5) / 0.5);
 }
 
 /**
@@ -222,3 +269,49 @@ export function overlayBox(base: string[], box: string[], top: number, left: num
 }
 
 export const ansiLen = vwidth;
+
+/**
+ * Curated, monochrome Unicode icon set — replaces the emoji that drifted box
+ * borders (variable East-Asian width) and clashed with the Lumen look. Every
+ * glyph here is verified single-cell by the width logic above, so it never
+ * shifts a frame. Colour comes only from theme tokens, never the glyph itself.
+ */
+export const ICONS = {
+  // session state
+  active: "◆",
+  monitor: "◑",
+  waiting: "◐",
+  idle: "○",
+  // selection / disclosure markers
+  collapsed: "▸",
+  expanded: "▾",
+  cursor: "▶",
+  bar: "▌",
+  caret: "▏",
+  // prompts / transcript flow
+  prompt: "❯",
+  stream: "⟩",
+  tool: "·",
+  result: "⎿",
+  gutter: "▎",
+  text: "▪",
+  // entities
+  account: "◈",
+  org: "⌂",
+  folder: "▤",
+  repo: "▣",
+  file: "▦",
+  branch: "⎇",
+  context: "◫",
+  host: "◇",
+  // status / meta
+  background: "⊙",
+  thinking: "✦",
+  attach: "❏",
+  rename: "✎",
+  newAgent: "✦",
+  issue: "❖",
+  ok: "✓",
+  fail: "✗",
+  refresh: "↻",
+} as const;
