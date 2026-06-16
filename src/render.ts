@@ -477,7 +477,13 @@ function renderGrid(
   }
   if (!qs.length) out.push(`  ${DIM}${t("noSessions")}${RESET}`);
   // inline-flow rows: INST STATE TIME title · worktree — message (tight, no columns)
-  const clock = (ms: number) => { const d = new Date(ms); const p = (n: number) => String(n).padStart(2, "0"); return `${p(d.getHours())}:${p(d.getMinutes())}`; };
+  const clock = (ms: number) => {
+    const d = new Date(ms), nd = new Date(now);
+    const z = (x: number) => String(x).padStart(2, "0");
+    const hm = `${z(d.getHours())}:${z(d.getMinutes())}`;
+    const today = d.getFullYear() === nd.getFullYear() && d.getMonth() === nd.getMonth() && d.getDate() === nd.getDate();
+    return today ? hm : `${z(d.getDate())}.${z(d.getMonth() + 1)} ${hm}`;
+  };
   const lsel = Math.min(Math.max(0, ui.listSel), Math.max(0, qs.length - 1));
   // group the closeable sessions by repo: a header per repo, sessions underneath
   const repoKeyOf = (w: WaitingSession) => repoSlug(w.ss.cwd) || dirName(w.ss.cwd);
