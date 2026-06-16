@@ -1,6 +1,6 @@
 {
   "name": "claudeplex",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A terminal multiplexer & cockpit for Claude Code — monitor and orchestrate multiple Claude Max accounts from one TUI.",
   "type": "module",
   "bin": {
