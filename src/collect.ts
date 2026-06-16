@@ -134,14 +134,14 @@ function describeMessage(
     if (typeof content === "string") {
       if (/<system-reminder>|tool_result|<local-command|<command-(name|message|args|stdout)/.test(content))
         return null;
-      return { text: clip(content), kind: "user" };
+      return { text: clip(content, 500), kind: "user" };
     }
     return null; // array user messages are tool results — skip as noise
   }
   // assistant
   const clean = (t: string) => (t && t.trim() && t.trim() !== "(no content)" ? t : "");
   if (typeof content === "string")
-    return clean(content) ? { text: clip(content), kind: "text" } : null;
+    return clean(content) ? { text: clip(content, 500), kind: "text" } : null;
   if (!Array.isArray(content)) return null;
   let text = "";
   let tool: string | null = null;
@@ -150,7 +150,7 @@ function describeMessage(
     else if (part?.type === "tool_use" && part.name) tool = toolSummary(part.name, part.input);
   }
   if (tool) return { text: tool, kind: "tool" };
-  if (text) return { text: clip(text), kind: "text" };
+  if (text) return { text: clip(text, 500), kind: "text" };
   return null;
 }
 
