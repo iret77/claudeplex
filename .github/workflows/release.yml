@@ -1,19 +1,45 @@
 name: release
 
+# Builds the standalone binaries on a macOS runner (so codesign/notarytool are
+# available), optionally signs + notarizes the macOS binaries, then publishes a
+# GitHub Release. Signing/notarization are OPT-IN via repo secrets — without them
+# the workflow still publishes working (unsigned) binaries. Release notes are
+# auto-generated from commits.
+#
+# Required repo secrets to enable macOS signing (Settings → Secrets → Actions):
+#   MACOS_CERT_P12        base64 of the "Developer ID Application" cert (.p12)
+#                         export from Keychain, then: base64 -i cert.p12 | pbcopy
+#   MACOS_CERT_PASSWORD   the .p12 export password
+#   MACOS_SIGN_IDENTITY   e.g. "Developer ID Application: High5 Ventures GmbH (TEAMID)"
+# Additionally, to notarize:
+#   NOTARY_KEY_P8         base64 of the App Store Connect API key (AuthKey_*.p8)
+#   NOTARY_KEY_ID         the key id
+#   NOTARY_ISSUER         the issuer UUID
+# (Optional) auto-bump the Homebrew tap:
+#   HOMEBREW_TAP_DEPLOY_KEY  ssh deploy key with write access to iret77/homebrew-tap
+
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.3.0)"
+        required: true
 
 permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build & publish binaries
-    runs-on: ubuntu-latest
+  release:
+    name: Build, sign & publish
+    runs-on: macos-14
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -23,18 +49,74 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Typecheck
-        run: bun run typecheck
+        run: bunx tsc --noEmit
 
       - name: Build standalone binaries (all targets)
         run: bun run build
 
-      - name: Checksums
+      - name: Detect signing secrets
+        id: gate
+        env:
+          CERT: ${{ secrets.MACOS_CERT_P12 }}
+          NOTARY: ${{ secrets.NOTARY_KEY_P8 }}
+        run: |
+          { [ -n "$CERT" ] && echo "sign=true" || echo "sign=false"; } >> "$GITHUB_OUTPUT"
+          { [ -n "$NOTARY" ] && echo "notarize=true" || echo "notarize=false"; } >> "$GITHUB_OUTPUT"
+          [ -n "$CERT" ] && echo "macOS signing: ON" || echo "macOS signing: off (no MACOS_CERT_P12 secret)"
+
+      - name: Import Developer ID certificate
+        if: steps.gate.outputs.sign == 'true'
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PWD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KP="ci-$RANDOM-$RANDOM"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KP" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KP" build.keychain
+          security set-keychain-settings -lut 3600 build.keychain
+          security import "$RUNNER_TEMP/cert.p12" -k build.keychain -P "$CERT_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KP" build.keychain
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Codesign macOS binaries
+        if: steps.gate.outputs.sign == 'true'
+        env:
+          IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          for b in dist/claudeplex-darwin-arm64 dist/claudeplex-darwin-x64; do
+            codesign --force --options runtime --timestamp --sign "$IDENTITY" "$b"
+            codesign --verify --strict --verbose=2 "$b"
+          done
+
+      - name: Notarize macOS binaries
+        if: steps.gate.outputs.sign == 'true' && steps.gate.outputs.notarize == 'true'
+        env:
+          KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          ISSUER: ${{ secrets.NOTARY_ISSUER }}
+        run: |
+          echo "$KEY_P8" | base64 --decode > "$RUNNER_TEMP/key.p8"
+          for b in dist/claudeplex-darwin-arm64 dist/claudeplex-darwin-x64; do
+            ditto -c -k --keepParent "$b" "$RUNNER_TEMP/n.zip"
+            xcrun notarytool submit "$RUNNER_TEMP/n.zip" \
+              --key "$RUNNER_TEMP/key.p8" --key-id "$KEY_ID" --issuer "$ISSUER" --wait
+            rm -f "$RUNNER_TEMP/n.zip"
+          done
+          rm -f "$RUNNER_TEMP/key.p8"
+
+      - name: Smoke-test the arm64 binary
+        run: ./dist/claudeplex-darwin-arm64 --json > /dev/null
+
+      - name: Checksums (after signing — signing rewrites the bytes)
         working-directory: dist
         run: shasum -a 256 claudeplex-* > SHA256SUMS.txt
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
           files: |
             dist/claudeplex-*
             dist/SHA256SUMS.txt
@@ -42,7 +124,7 @@ jobs:
           fail_on_unmatched_files: true
 
       - name: Bump Homebrew tap formula
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(env.TAG, 'v')
         env:
           DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
         run: |
@@ -53,7 +135,7 @@ jobs:
           printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${TAG#v}"
           bun run scripts/formula.ts "$VERSION" dist/SHA256SUMS.txt > formula.rb
           git clone git@github.com:iret77/homebrew-tap.git tap
           mkdir -p tap/Formula
