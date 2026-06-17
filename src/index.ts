@@ -2,9 +2,10 @@
 import { collectAll, dismissSession, instanceFolders, type InstanceState } from "./collect.ts";
 import {
   render, recentCwds, waitingSessions, closeableSessions, cockpitTabs,
-  wizardFolders, wizardOrderedInstances, issueRepos, emptyPane, type UIState,
+  wizardFolders, wizardOrderedInstances, issueRepos, emptyPane,
+  type UIState, type PaneItem, type CmdPane,
 } from "./render.ts";
-import { updateStates, type Transition } from "./tracker.ts";
+import { updateStates, type Transition, type SessState } from "./tracker.ts";
 import { AgentRegistry } from "./agents.ts";
 import { BUDGET_5H, BUDGET_WEEK, type InstanceDef } from "./instances.ts";
 import { discoverInstances } from "./discover.ts";
@@ -13,7 +14,8 @@ import { readClipboardImage } from "./clipboard.ts";
 import { loadLocale, toggleLocale, t, stateLabel } from "./i18n.ts";
 import { loadTheme, previewTheme, setTheme, themeIndex, getTheme, THEMES } from "./theme.ts";
 import { remoteSnapshot, launchRcServer, stopRcServer, fetchRemoteFleet, tmuxName } from "./remote.ts";
-import { discoverHosts, isLocal, type Host } from "./hosts.ts";
+import { discoverHosts, isLocal, sshTarget, type Host } from "./hosts.ts";
+import { tfg, ICONS, RESET } from "./ui.ts";
 import { listDir, resolveHome, pathJoin, shellOutArgv, copyEntry } from "./ssh.ts";
 import { pickFreeInstance, draftIssue, createIssue, splitDraft, isError } from "./issue.ts";
 
@@ -110,8 +112,8 @@ function runLoop(): void {
     picker: "", pickerInput: "", pickerSel: 0, pickerInstance: "", pickerPane: "instance", pickerInstSel: 0,
     pickerMode: "instance", gridRegion: "cards", collapsed: { cards: false, live: false, questions: false }, closeArm: "", renaming: "",
     themePicker: false, themeSel: 0,
-    commander: false, cmdLevel: "hosts", cmdHosts: [], cmdHostSel: 0, cmdActive: 0,
-    cmdPanes: [emptyPane(), emptyPane()], cmdRemote: null, cmdFeedback: "",
+    commander: false, cmdHosts: [], cmdActive: 0,
+    cmdPanes: [emptyPane(), emptyPane()], cmdRemote: null, cmdFeedback: "", fromCommander: false,
     issueStage: "pick", issuePane: "folder", issueFolderSel: 0, issueInput: "", issueFeedback: "",
     issueDraft: "", issueScroll: 0, issueRepo: "", issueInstance: "", issueUrl: "", issueError: "",
   };
@@ -232,82 +234,459 @@ function runLoop(): void {
     });
   };
 
-  // ── Commander (multi-host) ──
+  // ── Commander (multi-host, mc/nc) — the whole app is the commander ──
   const cmdTokens = [0, 0]; // per-pane stale-async guards
-
-  /** Open the Commander; resolve the host list once. Return to files if a pane is set. */
-  const openCommander = (): void => {
-    ui.commander = true;
-    ui.cmdHosts = discoverHosts();
-    ui.cmdHostSel = 0;
-    ui.cmdFeedback = "";
-    ui.cmdLevel = ui.cmdPanes.some((p) => p.host) ? "files" : "hosts";
+  const baseName = (p: string) => p.replace(/\/+$/, "").split("/").pop() || p;
+  const sizeStr = (n: number) =>
+    n < 1024 ? `${n}B` : n < 1048576 ? `${Math.round(n / 1024)}K` : `${(n / 1048576).toFixed(1)}M`;
+  const dirParent = (p: string) => { const i = p.replace(/\/+$/, "").lastIndexOf("/"); return i <= 0 ? "/" : p.slice(0, i); };
+  /** Longest common directory prefix (by path segment) of a set of paths. */
+  const commonRoot = (paths: string[]): string => {
+    if (!paths.length) return "/";
+    const segs = paths.map((p) => p.replace(/\/+$/, "").split("/"));
+    let n = segs[0].length;
+    for (const s of segs) { let i = 0; while (i < n && i < s.length && s[i] === segs[0][i]) i++; n = i; }
+    return segs[0].slice(0, n).join("/") || "/";
   };
 
-  /** The Host object backing a pane. */
   const cmdHostOf = (p: { host: string }): Host | undefined => ui.cmdHosts.find((h) => h.name === p.host);
+  const cmdSel = (p: CmdPane): PaneItem | undefined => p.items[Math.min(Math.max(0, p.sel), p.items.length - 1)];
+  /** rc-server tmux key for a host: local picks the selected account, else "default". */
+  const rcKey = (host: Host): string =>
+    (isLocal(host) ? (instances[ui.sel] ?? instances[0])?.key : undefined) ?? "default";
 
-  /** Refresh the fleet/governor for the active host: local = live snapshot, remote = ssh --json. */
-  const refreshFleet = (host: Host): void => {
-    if (isLocal(host)) {
-      ui.cmdRemote = remoteSnapshot(instances);
-      return;
-    }
+  /** Refresh the active pane's host fleet/governor (local live, remote via ssh --json). */
+  const refreshFleet = (host: Host | undefined): void => {
+    if (!host) { ui.cmdRemote = null; return; }
+    if (isLocal(host)) { ui.cmdRemote = remoteSnapshot(instances); return; }
     void fetchRemoteFleet(host).then((snap) => {
-      const active = ui.cmdPanes[ui.cmdActive];
-      if (ui.commander && active.host === host.name) {
-        ui.cmdRemote = snap;
-        draw();
-      }
+      if (ui.commander && cmdHostOf(ui.cmdPanes[ui.cmdActive])?.name === host.name) { ui.cmdRemote = snap; draw(); }
     });
   };
 
-  /** Fetch (async) the listing of `path` on a host into pane `idx`; ignores stale results. */
-  const fetchListing = (idx: number, host: Host, path: string): void => {
+  const UP_ITEM: PaneItem = { kind: "up", label: ".." };
+
+  // ── Conductor: the Host▸Project▸Session agent tree (left pane) ──
+  const treeExpanded = new Set<string>(); // expanded node ids, persists across rebuilds
+  let treeInit = false;
+  const modelShort = (m: string) => m.match(/(opus|sonnet|haiku|fable)/i)?.[1]?.toLowerCase() ?? "";
+  const ctxPct = (ctx: number, m: string) => (ctx > 0 ? Math.round((ctx / (/opus|sonnet/i.test(m) ? 1e6 : 2e5)) * 100) : 0);
+  const stateBadge = (st: SessState): string => {
+    const th = getTheme();
+    const [w, col] = st === "aktiv" ? ["WORK", th.success] : st === "wartet" ? ["WAIT", th.warning]
+      : st === "monitor" ? ["MON", th.accentHi] : ["IDLE", th.text3];
+    return `${tfg(col as any)}[${w}]${RESET}`;
+  };
+  /** Plain-language project/host summary badge: "[2 WORK] [1 WAIT]" or dim "idle". */
+  const summaryBadge = (work: number, wait: number, total: number): string => {
+    const th = getTheme();
+    const b: string[] = [];
+    if (work) b.push(`${tfg(th.success)}${work} WORK${RESET}`);
+    if (wait) b.push(`${tfg(th.warning)}${wait} WAIT${RESET}`);
+    if (!b.length) b.push(`${tfg(th.textDim)}${total ? "idle" : "—"}${RESET}`);
+    return b.join("  ");
+  };
+
+  /** Build the flattened agent tree into pane `idx` (respecting `treeExpanded`). */
+  const buildTree = (idx: number): void => {
     const p = ui.cmdPanes[idx];
-    p.loading = true;
+    p.view = "tree"; p.error = ""; p.loading = false; p.title = "Projects & Agents";
+    if (!ui.cmdHosts.length) ui.cmdHosts = discoverHosts();
+    const local = ui.cmdHosts.find((h) => isLocal(h));
+    if (!treeInit) { treeInit = true; if (local) treeExpanded.add(`h:${local.name}`); }
+    const th = getTheme();
+    const items: PaneItem[] = [];
+
+    type Sess = { acct: string; state: SessState; title: string; sessionId: string; cwd: string; path: string; model: string; ctx: number; ts: number };
+    interface TNode { path: string; label: string; sessions: Sess[]; kids: Map<string, TNode>; work: number; wait: number; ts: number }
+    const mkNode = (path: string): TNode => ({ path, label: baseName(path) || path, sessions: [], kids: new Map(), work: 0, wait: 0, ts: 0 });
+    const sessItem = (ss: Sess, depth: number): PaneItem => {
+      const pc = ctxPct(ss.ctx, ss.model);
+      return {
+        kind: "session", label: ss.title || baseName(ss.cwd) || ss.sessionId.slice(0, 8), depth,
+        badge: `${stateBadge(ss.state)} ${tfg(th.text3)}${modelShort(ss.model)}${pc ? " " + pc + "%" : ""}${RESET}`,
+        state: ss.state, sessionId: ss.sessionId, cwd: ss.cwd, path: ss.path, accountKey: ss.acct,
+      };
+    };
+
+    for (const h of ui.cmdHosts) {
+      const hid = `h:${h.name}`;
+      const hExp = treeExpanded.has(hid);
+      const all: Sess[] = [];
+      if (isLocal(h)) {
+        for (const s of states) for (const ss of s.sessions) {
+          if (!ss.cwd) continue;
+          all.push({ acct: s.def.key, state: ss.state, title: ss.title, sessionId: ss.sessionId, cwd: ss.cwd, path: ss.path, model: ss.model, ctx: ss.ctxTokens, ts: ss.lastTs });
+        }
+      }
+      const hostBadge = h.online === false ? `${tfg(th.textDim)}offline${RESET}`
+        : summaryBadge(all.filter((x) => x.state === "aktiv").length, all.filter((x) => x.state === "wartet").length, all.length);
+      items.push({ kind: "host", label: h.name, depth: 0, expandable: true, expanded: hExp, nodeId: hid, badge: hostBadge, host: h.name, online: h.online });
+      if (!hExp) continue;
+      if (!all.length) { items.push({ kind: "project", label: `${tfg(th.textDim)}(no active agents)${RESET}`, depth: 1 }); continue; }
+
+      // path trie of the session cwds; sessions live at their leaf dir
+      const root = commonRoot(all.map((s) => s.cwd));
+      const nodes = new Map<string, TNode>();
+      const ensure = (path: string) => nodes.get(path) ?? (nodes.set(path, mkNode(path)), nodes.get(path)!);
+      ensure(root);
+      for (const s of all) {
+        ensure(s.cwd).sessions.push(s);
+        let cur = s.cwd;
+        while (cur.length > root.length && cur !== root) {
+          const par = dirParent(cur);
+          ensure(par).kids.set(cur, ensure(cur));
+          cur = par;
+        }
+      }
+      // bottom-up aggregate → the "needs-me" attractor bubbles UP to every ancestor dir
+      const agg = (n: TNode): void => {
+        let w = 0, wt = 0, ts = 0;
+        for (const s of n.sessions) { if (s.state === "aktiv") w++; else if (s.state === "wartet") wt++; ts = Math.max(ts, s.ts); }
+        for (const c of n.kids.values()) { agg(c); w += c.work; wt += c.wait; ts = Math.max(ts, c.ts); }
+        n.work = w; n.wait = wt; n.ts = ts;
+      };
+      agg(nodes.get(root)!);
+      // collapse single-child dir chains with no own sessions ("a/b/c" as one row)
+      const compress = (n: TNode): TNode => {
+        let cur = n;
+        while (cur.sessions.length === 0 && cur.kids.size === 1) {
+          const c = [...cur.kids.values()][0];
+          c.label = `${cur.label}/${c.label}`;
+          cur = c;
+        }
+        const nk = new Map<string, TNode>();
+        for (const c of cur.kids.values()) { const cc = compress(c); nk.set(cc.path, cc); }
+        cur.kids = nk;
+        return cur;
+      };
+      const actionable = (a: TNode, b: TNode) => (b.wait - a.wait) || (b.work - a.work) || (b.ts - a.ts);
+      const flatten = (n: TNode, depth: number): void => {
+        const nid = `d:${h.name}:${n.path}`;
+        const exp = treeExpanded.has(nid);
+        items.push({
+          kind: "project", label: n.label, depth, expandable: n.kids.size > 0 || n.sessions.length > 0, expanded: exp, nodeId: nid,
+          badge: summaryBadge(n.work, n.wait, n.sessions.length + n.kids.size), host: h.name, path: n.path,
+        });
+        if (!exp) return;
+        for (const c of [...n.kids.values()].sort(actionable)) flatten(c, depth + 1);
+        for (const ss of n.sessions.sort((a, b) => b.ts - a.ts)) items.push({ ...sessItem(ss, depth + 1), host: h.name });
+      };
+      const cr = compress(nodes.get(root)!);
+      const tops = cr.sessions.length ? [cr] : [...cr.kids.values()].sort(actionable);
+      for (const tn of tops) flatten(tn, 1);
+    }
+    p.items = items;
+  };
+
+  /** Claude context for the active host — the heart of the claudeplex×mc fusion.
+   *  Local: sessions from `states` + RC servers from the live snapshot. Remote:
+   *  RC servers from the cached fleet (sessions need the host's --json; TODO). */
+  const claudeIndex = (p: CmdPane) => {
+    const host = cmdHostOf(p);
+    const sessions: { accountKey: string; cwd: string; state: SessState; title: string; sessionId: string }[] = [];
+    const rc = new Map<string, string | undefined>(); // project cwd → tmux name (RC server runs there)
+    if (host && isLocal(host)) {
+      for (const s of states) for (const ss of s.sessions) {
+        if (ss.cwd) sessions.push({ accountKey: s.def.key, cwd: ss.cwd, state: ss.state, title: ss.title, sessionId: ss.sessionId });
+      }
+      for (const sv of remoteSnapshot(instances).servers) rc.set(sv.cwd, sv.tmux ?? undefined);
+    } else if (host && ui.cmdRemote && cmdHostOf(ui.cmdPanes[ui.cmdActive])?.name === host.name) {
+      for (const sv of ui.cmdRemote.servers) rc.set(sv.cwd, sv.tmux ?? undefined);
+    }
+    return { sessions, rc };
+  };
+
+  /** Coloured Claude annotation for a directory row: session-state counts + RC marker. */
+  const dirAnnotation = (childPath: string, ix: ReturnType<typeof claudeIndex>): string => {
+    const th = getTheme();
+    const under = ix.sessions.filter((s) => s.cwd === childPath || s.cwd.startsWith(childPath + "/"));
+    const n = (st: SessState) => under.filter((s) => s.state === st).length;
+    const a = n("aktiv"), m = n("monitor"), w = n("wartet"), st = n("stale");
+    return [
+      a && `${tfg(th.success)}${ICONS.active}${a}${RESET}`,
+      m && `${tfg(th.accentHi)}${ICONS.monitor}${m}${RESET}`,
+      w && `${tfg(th.warning)}${ICONS.waiting}${w}${RESET}`,
+      st && `${tfg(th.text3)}${ICONS.idle}${st}${RESET}`,
+      ix.rc.has(childPath) && `${tfg(th.accent)}${ICONS.background}${RESET}`,
+    ].filter(Boolean).join(" ");
+  };
+
+  /** (Re)build a pane's items from its view. Sync for hosts/drives/accounts/sessions/local-fleet;
+   *  async for files + remote fleet. */
+  const listPane = (idx: number): void => {
+    const p = ui.cmdPanes[idx];
+    const host = cmdHostOf(p);
     p.error = "";
-    p.path = path;
-    p.sel = 0;
     if (idx === ui.cmdActive) refreshFleet(host);
+
+    if (p.view === "hosts") {
+      ui.cmdHosts = discoverHosts();
+      p.items = ui.cmdHosts.map((h): PaneItem => ({ kind: "host", label: h.name, meta: sshTarget(h), online: h.online, host: h.name }));
+      p.title = `${t("cmdNetwork")} · ${ui.cmdHosts.length}`;
+      p.loading = false;
+      return;
+    }
+    if (p.view === "drives") {
+      p.items = [UP_ITEM,
+        { kind: "drive", label: "Files", drive: "files" },
+        { kind: "drive", label: "Accounts", drive: "accounts" },
+        { kind: "drive", label: "RC-Fleet", drive: "fleet" }];
+      p.title = `${p.host}`;
+      p.loading = false;
+      return;
+    }
+    if (p.view === "accounts") {
+      p.items = [UP_ITEM, ...states.map((s): PaneItem => ({
+        kind: "account", label: `${s.def.key} ${s.def.label}`,
+        meta: `${s.account.plan || "—"} · ${s.sessions.filter((x) => x.live).length}↑`, accountKey: s.def.key,
+      }))];
+      p.title = `${p.host} · Accounts`;
+      p.loading = false;
+      return;
+    }
+    if (p.view === "sessions") {
+      const sess = states.find((s) => s.def.key === p.accountKey)?.sessions ?? [];
+      p.items = [UP_ITEM, ...sess.map((ss): PaneItem => ({
+        kind: "session", label: ss.title || (ss.cwd ? "~" + baseName(ss.cwd) : ss.sessionId.slice(0, 8)),
+        meta: stateLabel(ss.state), state: ss.state, sessionId: ss.sessionId, cwd: ss.cwd, accountKey: p.accountKey,
+      }))];
+      p.title = `${p.accountKey} · Sessions`;
+      p.loading = false;
+      return;
+    }
+    if (p.view === "fleet") {
+      p.title = `${p.host} · RC-Fleet`;
+      const build = (snap: ReturnType<typeof remoteSnapshot>) => {
+        ui.cmdRemote = snap;
+        p.items = [UP_ITEM, ...snap.servers.map((sv): PaneItem => ({
+          kind: "rcserver", label: baseName(sv.cwd) || sv.cwd,
+          meta: `${sv.memMb}MB · ${sv.sessions.length}s`, host: p.host, cwd: sv.cwd, tmux: sv.tmux ?? undefined,
+        }))];
+        p.loading = false;
+      };
+      if (host && isLocal(host)) build(remoteSnapshot(instances));
+      else if (host) {
+        p.loading = true;
+        const token = ++cmdTokens[idx];
+        void fetchRemoteFleet(host).then((snap) => {
+          if (token !== cmdTokens[idx] || !ui.commander) return;
+          if (snap) build(snap);
+          else { p.items = [UP_ITEM]; p.loading = false; p.error = "fleet unavailable (claudeplex on PATH?)"; }
+          draw();
+        });
+      }
+      return;
+    }
+    // files — fused with Claude context: sessions/RC of THIS dir as virtual
+    // entries at the top, child dirs annotated with their session-state + RC.
+    if (!host) { p.items = [UP_ITEM]; p.loading = false; return; }
+    p.loading = true;
+    p.title = `${p.host}:${p.path}`;
     const token = ++cmdTokens[idx];
-    void listDir(host, path).then(
+    void listDir(host, p.path).then(
       (entries) => {
         if (token !== cmdTokens[idx] || !ui.commander) return;
-        p.entries = entries;
+        const ix = claudeIndex(p);
+        const th = getTheme();
+        const virtual: PaneItem[] = [];
+        for (const ss of ix.sessions.filter((s) => s.cwd === p.path)) {
+          virtual.push({
+            kind: "session", label: ss.title || ss.sessionId.slice(0, 8),
+            meta: `${tfg(th.text3)}${ss.accountKey}${RESET}`, state: ss.state,
+            sessionId: ss.sessionId, cwd: ss.cwd, accountKey: ss.accountKey,
+          });
+        }
+        if (ix.rc.has(p.path)) {
+          virtual.push({
+            kind: "rcserver", label: "remote-control",
+            meta: `${tfg(th.accent)}${ICONS.background} RC${RESET}`,
+            host: p.host, cwd: p.path, tmux: ix.rc.get(p.path),
+          });
+        }
+        const rows = entries.map((e): PaneItem => {
+          const childPath = pathJoin(p.path, e.name);
+          const meta = e.type === "dir"
+            ? dirAnnotation(childPath, ix)
+            : `${tfg(th.textDim)}${sizeStr(e.size)}${RESET}`;
+          return {
+            kind: e.type === "dir" ? "dir" : e.type === "link" ? "link" : "file",
+            label: e.name, meta, host: p.host, path: childPath,
+          };
+        });
+        p.items = [UP_ITEM, ...virtual, ...rows];
         p.loading = false;
         draw();
       },
       (e) => {
         if (token !== cmdTokens[idx] || !ui.commander) return;
-        p.entries = [];
-        p.loading = false;
-        p.error = String(e?.message ?? e);
-        draw();
+        p.items = [UP_ITEM]; p.loading = false; p.error = String(e?.message ?? e); draw();
       },
     );
   };
 
-  /** Enter a host into the ACTIVE pane: resolve its home (absolute), then list it. */
-  const enterHost = (h: Host): void => {
-    const idx = ui.cmdActive;
+  /** Ascend the hierarchy in pane `idx`. */
+  const goUp = (idx: number): void => {
     const p = ui.cmdPanes[idx];
-    p.host = h.name;
-    p.entries = [];
-    p.loading = true;
-    ui.cmdLevel = "files";
+    p.sel = 0;
+    if (p.view === "files") {
+      const parent = pathJoin(p.path, "..");
+      if (cmdHostOf(p) && parent !== p.path) { p.path = parent; listPane(idx); }
+      else { p.view = "drives"; listPane(idx); }
+    } else if (p.view === "sessions") { p.view = "accounts"; listPane(idx); }
+    else if (p.view === "accounts" || p.view === "fleet") { p.view = "drives"; listPane(idx); }
+    else if (p.view === "drives") { p.view = "hosts"; listPane(idx); }
+    // hosts = root → nothing
+  };
+
+  /** Open a session as a full-screen cockpit view (returns to the Commander on Esc). */
+  const openSession = (it: PaneItem): void => {
+    const def = instances.find((d) => d.key === it.accountKey) ?? instances[0];
+    if (!def || !it.sessionId) { ui.cmdFeedback = "no account for session"; return; }
+    ui.focus = `a:${enterSession(def, it.sessionId, it.cwd || process.env.HOME || ".", 0)}`;
+    ui.fromCommander = true; // Esc in the cockpit returns here
+    ui.commander = false;
+    ui.cockpit = true;
+    ui.cockpitArea = "input";
+  };
+
+  /** Enter the selected item in pane `idx` (descend the hierarchy / act). */
+  const enterItem = (idx: number): void => {
+    const p = ui.cmdPanes[idx];
+    const it = cmdSel(p);
+    if (!it) return;
+    if (it.kind === "up") { goUp(idx); return; }
+    const host = cmdHostOf(p);
+    if (it.kind === "host") { p.host = it.host!; p.view = "drives"; p.sel = 0; listPane(idx); }
+    else if (it.kind === "drive") {
+      p.view = it.drive!; p.sel = 0;
+      if (it.drive === "files" && host) {
+        p.loading = true;
+        const tk = ++cmdTokens[idx];
+        void resolveHome(host).then((home) => { if (tk !== cmdTokens[idx] || !ui.commander) return; p.path = home; listPane(idx); draw(); });
+      } else listPane(idx);
+    } else if (it.kind === "dir") { if (host) { p.path = it.path!; p.sel = 0; listPane(idx); } }
+    else if (it.kind === "account") { p.accountKey = it.accountKey!; p.view = "sessions"; p.sel = 0; listPane(idx); }
+    else if (it.kind === "session") { openSession(it); }
+    else if (it.kind === "rcserver") { if (host && it.tmux) shellOut(shellOutArgv(host, { tmux: it.tmux })); }
+    // file/link: leaf — no descent (use Shell/F3 to open a shell in the dir)
+  };
+
+  /** The currently-selected node in the left tree. */
+  const treeSel = (): PaneItem | undefined => {
+    const p = ui.cmdPanes[0];
+    return p.items[Math.min(Math.max(0, p.sel), p.items.length - 1)];
+  };
+
+  /** Toggle expand/collapse of the selected tree node (or open it if a leaf session). */
+  const treeEnter = (): void => {
+    const p = ui.cmdPanes[0];
+    const it = treeSel();
+    if (!it) return;
+    if (it.expandable && it.nodeId) {
+      if (treeExpanded.has(it.nodeId)) treeExpanded.delete(it.nodeId);
+      else treeExpanded.add(it.nodeId);
+      buildTree(0);
+    } else if (it.kind === "session") {
+      openSession(it); // → full cockpit to steer
+    }
+  };
+
+  /** Collapse the selected node, or its parent if already collapsed/leaf. */
+  const treeCollapse = (): void => {
+    const p = ui.cmdPanes[0];
+    const it = treeSel();
+    if (!it) return;
+    if (it.expandable && it.expanded && it.nodeId) { treeExpanded.delete(it.nodeId); buildTree(0); return; }
+    const d = it.depth ?? 0;
+    for (let i = p.sel - 1; i >= 0; i--) {
+      if ((p.items[i].depth ?? 0) === d - 1) {
+        const par = p.items[i];
+        if (par.nodeId) treeExpanded.delete(par.nodeId);
+        buildTree(0);
+        p.sel = i;
+        return;
+      }
+    }
+  };
+
+  /** Jump the tree selection to the next agent waiting for input (expands as needed). */
+  const jumpNextWaiting = (): void => {
+    const p = ui.cmdPanes[0];
+    const local = ui.cmdHosts.find((h) => isLocal(h));
+    // expand the host + every dir on the path to each waiting session (all prefixes
+    // — covers compressed chain nodes whose id is the deepest path on the chain)
+    for (const s of states) for (const ss of s.sessions) {
+      if (ss.state !== "wartet" || !local || !ss.cwd) continue;
+      treeExpanded.add(`h:${local.name}`);
+      let cur = ss.cwd;
+      while (cur.length > 1) { treeExpanded.add(`d:${local.name}:${cur}`); cur = dirParent(cur); }
+    }
+    ui.cmdActive = 0;
+    buildTree(0);
+    const waits = p.items.map((it, i) => ({ it, i })).filter((x) => x.it.kind === "session" && x.it.state === "wartet").map((x) => x.i);
+    if (!waits.length) { ui.cmdFeedback = "no agents waiting"; return; }
+    p.sel = waits.find((i) => i > p.sel) ?? waits[0];
     ui.cmdFeedback = "";
-    const token = ++cmdTokens[idx];
-    void resolveHome(h).then((home) => {
-      if (token !== cmdTokens[idx] || !ui.commander) return;
-      fetchListing(idx, h, home);
-    });
+  };
+
+  /** Flip the RIGHT pane between the live session detail and a file browser of the selection. */
+  const toggleRight = (): void => {
+    const r = ui.cmdPanes[1];
+    if (r.view === "files") { r.view = "session"; return; }
+    const sel = treeSel();
+    const host = sel?.host ? ui.cmdHosts.find((h) => h.name === sel.host) : ui.cmdHosts.find((h) => isLocal(h));
+    const cwd = sel?.path ?? sel?.cwd;
+    if (host && cwd) { r.view = "files"; r.host = host.name; r.path = cwd; r.sel = 0; listPane(1); }
+    else ui.cmdFeedback = "select a project to browse its files";
+  };
+
+  /** Launch a fresh agent in the selected node's project dir → straight to the cockpit. */
+  const newAgentHere = (sel: PaneItem | undefined): void => {
+    const cwd = sel?.path ?? sel?.cwd;
+    if (!cwd) { ui.cmdFeedback = "select a project first"; return; }
+    const def = instances[ui.sel] ?? instances[0];
+    if (!def) { ui.cmdFeedback = "no account"; return; }
+    ui.focus = `a:${registry.launch(def, cwd).launchId}`;
+    ui.fromCommander = true; ui.commander = false; ui.cockpit = true; ui.cockpitArea = "input";
+  };
+
+  /** Shell-out into the selected node's project dir (real PTY). */
+  const shellHere = (sel: PaneItem | undefined): void => {
+    const host = sel?.host ? ui.cmdHosts.find((h) => h.name === sel.host) : ui.cmdHosts.find((h) => isLocal(h));
+    const cwd = sel?.path ?? sel?.cwd;
+    if (host && cwd) shellOut(shellOutArgv(host, { cwd }));
+  };
+
+  /** Land in the Conductor: left = agent tree, right = live session detail. */
+  const commanderHome = (): void => {
+    ui.commander = true;
+    ui.cmdHosts = discoverHosts();
+    ui.cmdFeedback = "";
+    ui.cmdActive = 0;
+    buildTree(0);
+    ui.cmdPanes[1].view = "session";
+    ui.cmdPanes[1].items = [];
+    refreshFleet(ui.cmdHosts.find((h) => isLocal(h)));
+  };
+
+  /** Open the Commander: resume if the tree is built, else home. */
+  const openCommander = (): void => {
+    ui.commander = true;
+    ui.cmdFeedback = "";
+    if (!ui.cmdPanes.some((p) => p.items.length)) commanderHome();
   };
 
   const doRefresh = (t: number) => {
     states = collectAll(instances, t);
     lastRefresh = t;
     notifyTransitions(updateStates(states, t));
+    // keep the agent tree live (preserving expand state + selection)
+    if (ui.commander && ui.cmdPanes[0].view === "tree") {
+      const keep = ui.cmdPanes[0].sel;
+      buildTree(0);
+      ui.cmdPanes[0].sel = Math.min(keep, Math.max(0, ui.cmdPanes[0].items.length - 1));
+    }
   };
 
   enterFullscreen(); // force the terminal window fullscreen (CD_NO_FULLSCREEN to skip)
@@ -343,6 +722,18 @@ function runLoop(): void {
       const PGUP = k === "\x1b[5~";
       const PGDN = k === "\x1b[6~";
       const page = Math.max(1, (process.stdout.rows || 40) - 8);
+      // function keys F1–F10 (xterm SS3 + CSI + linux-console forms) for the mc-style bar
+      const fkey =
+        k === "\x1bOP" || k === "\x1b[11~" || k === "\x1b[[A" ? 1 :
+        k === "\x1bOQ" || k === "\x1b[12~" || k === "\x1b[[B" ? 2 :
+        k === "\x1bOR" || k === "\x1b[13~" || k === "\x1b[[C" ? 3 :
+        k === "\x1bOS" || k === "\x1b[14~" || k === "\x1b[[D" ? 4 :
+        k === "\x1b[15~" || k === "\x1b[[E" ? 5 :
+        k === "\x1b[17~" ? 6 :
+        k === "\x1b[18~" ? 7 :
+        k === "\x1b[19~" ? 8 :
+        k === "\x1b[20~" ? 9 :
+        k === "\x1b[21~" ? 10 : 0;
 
       // No accounts discovered → quit / rescan / open the Commander (which can
       // browse remote hosts even with no local accounts).
@@ -376,102 +767,128 @@ function runLoop(): void {
 
       // Commander: Ebene 0 hosts → Ebene 1 two-pane files (copy/shell-out/RC control).
       if (ui.commander) {
-        if (k === "\x03") return quit();
-        if (ui.cmdLevel === "hosts") {
-          const hosts = ui.cmdHosts;
-          if (ESC) {
-            if (ui.cmdPanes.some((p) => p.host)) ui.cmdLevel = "files"; // a pane is set → back
-            else ui.commander = false;
-          } else if (UP) ui.cmdHostSel = Math.max(0, ui.cmdHostSel - 1);
-          else if (DOWN) ui.cmdHostSel = Math.min(Math.max(0, hosts.length - 1), ui.cmdHostSel + 1);
-          else if (ENTER || RIGHT) {
-            const h = hosts[Math.min(ui.cmdHostSel, Math.max(0, hosts.length - 1))];
-            if (h) enterHost(h);
-          } else return;
-          return draw();
-        }
-        // files level — operate on the ACTIVE pane
+        if (k === "q" || k === "\x03" || fkey === 10) return quit(); // q / Ctrl-C / F10
         const ai = ui.cmdActive;
         const p = ui.cmdPanes[ai];
         const other = ui.cmdPanes[ai === 0 ? 1 : 0];
         const host = cmdHostOf(p);
-        const rcOpts = () => {
-          const local = host ? isLocal(host) : false;
-          const def = local ? instances[ui.sel] ?? instances[0] : undefined;
+        const it = cmdSel(p);
+        const rcOpts = (h: Host) => {
+          const def = isLocal(h) ? (instances[ui.sel] ?? instances[0]) : undefined;
           return { key: def?.key ?? "default", configDir: def?.configDir, isDefault: def?.isDefault };
         };
-        const count = p.entries.length + 1; // +1 for the ".." row
-        const sel = Math.min(Math.max(0, p.sel), count - 1);
-        if (ESC) {
-          ui.cmdLevel = "hosts"; // re-pick the active pane's host
-          ui.cmdFeedback = "";
-        } else if (k === "\t") {
+
+        // ── global keys (any view) ──
+        if (fkey === 1) {
+          ui.cmdFeedback = "↑↓ move · ⏎ open/steer · → expand · ← collapse · w next-waiting · Tab pane · n new · s shell · F9 files · F8 theme · q quit";
+          return draw();
+        }
+        if (fkey === 8) {
+          themeOrig = getTheme().name;
+          ui.themeSel = themeIndex();
+          ui.themePicker = true;
+          return draw();
+        }
+        if (k === "\t") {
           ui.cmdActive = ai === 0 ? 1 : 0;
           ui.cmdFeedback = "";
-          const np = ui.cmdPanes[ui.cmdActive];
-          const nh = cmdHostOf(np);
-          if (np.host && nh) refreshFleet(nh);
-          else ui.cmdLevel = "hosts"; // empty pane → pick a host for it
+          refreshFleet(cmdHostOf(ui.cmdPanes[ui.cmdActive]));
+          return draw();
+        }
+        if (k === "w") { jumpNextWaiting(); return draw(); } // jump to next agent waiting on you
+
+        // ── tree: the agent overview (left spine) ──
+        if (p.view === "tree") {
+          const sel = treeSel();
+          if (UP) p.sel = Math.max(0, p.sel - 1);
+          else if (DOWN) p.sel = Math.min(Math.max(0, p.items.length - 1), p.sel + 1);
+          else if (ENTER || RIGHT || fkey === 3) treeEnter();
+          else if (LEFT) treeCollapse();
+          else if (fkey === 2) jumpNextWaiting();
+          else if (k === "f" || fkey === 9) toggleRight();
+          else if (k === "n" || fkey === 4) newAgentHere(sel);
+          else if (k === "i" || fkey === 5) openIssue();
+          else if (k === "s" || fkey === 6) shellHere(sel);
+          else return;
+          return draw();
+        }
+
+        // ── session detail (right pane) ──
+        if (p.view === "session") {
+          const sel = treeSel();
+          if (ENTER || fkey === 3) { if (sel?.kind === "session") openSession(sel); }
+          else if (LEFT || ESC) ui.cmdActive = 0;
+          else if (fkey === 2) jumpNextWaiting();
+          else if (k === "f" || fkey === 9) toggleRight();
+          else if (k === "n" || fkey === 4) newAgentHere(sel);
+          else if (k === "s" || fkey === 6) shellHere(sel);
+          else return;
+          return draw();
+        }
+
+        // ── files / drives / accounts / fleet (the mc browser) ──
+        if (fkey === 2) {
+          p.view = p.host ? "drives" : "hosts";
+          p.sel = 0; ui.cmdFeedback = ""; listPane(ai);
+        } else if (k === "f" || fkey === 9) {
+          ui.cmdPanes[1].view = "session"; ui.cmdActive = 0; // back to the tree+session conductor
         } else if (UP) {
-          p.sel = Math.max(0, sel - 1);
+          p.sel = Math.max(0, p.sel - 1);
         } else if (DOWN) {
-          p.sel = Math.min(count - 1, sel + 1);
-        } else if (LEFT) {
-          if (host) fetchListing(ai, host, pathJoin(p.path, ".."));
+          p.sel = Math.min(Math.max(0, p.items.length - 1), p.sel + 1);
+        } else if (LEFT || ESC) {
+          goUp(ai);
         } else if (ENTER || RIGHT) {
-          if (host) {
-            if (sel === 0) fetchListing(ai, host, pathJoin(p.path, ".."));
-            else {
-              const e = p.entries[sel - 1];
-              if (e && e.type === "dir") fetchListing(ai, host, pathJoin(p.path, e.name));
-            }
-          }
-        } else if (k === "c") {
-          // copy the active pane's selection → the OTHER pane's dir (host↔host, no scp)
-          const otherHost = cmdHostOf(other);
-          if (host && otherHost && other.host && sel > 0) {
-            const e = p.entries[sel - 1];
-            if (e) {
-              const srcPath = pathJoin(p.path, e.name);
-              const dstPath = other.path;
-              const oi = ai === 0 ? 1 : 0;
-              ui.cmdFeedback = t("cmdCopying");
-              void copyEntry({ host, path: srcPath }, { host: otherHost, path: dstPath }).then((r) => {
-                if (!ui.commander) return;
-                ui.cmdFeedback = r.ok ? `✓ ${e.name} → ${other.host}` : `error: ${r.error}`;
-                if (r.ok) fetchListing(oi, otherHost, dstPath); // refresh dest to show the copy
-                else draw();
-              });
-            }
-          } else if (!other.host) {
-            ui.cmdFeedback = `${t("cmdPickHost")} → ${t("cmdSwitch")} (Tab)`;
-          }
-        } else if (k === "s") {
+          enterItem(ai);
+        } else if (fkey === 4 && (p.view === "sessions" || p.view === "accounts")) {
+          openWizard(); // F4 → new-agent wizard
+        } else if (fkey === 5 && (p.view === "sessions" || p.view === "accounts")) {
+          openIssue(); // F5 → quick-issue
+        } else if (fkey === 3 && p.view !== "files") {
+          enterItem(ai); // F3 = Open/Enter/Attach in non-file views
+        } else if ((k === "s" || fkey === 3) && p.view === "files") {
           if (host) shellOut(shellOutArgv(host, { cwd: p.path }));
-        } else if (k === "L") {
+        } else if ((k === "c" || fkey === 5) && p.view === "files") {
+          // copy active selection → the OTHER pane's dir (host↔host, no scp)
+          const otherHost = cmdHostOf(other);
+          if (host && otherHost && other.view === "files" && it && it.path && it.kind !== "up") {
+            const srcPath = it.path, dstPath = other.path, oi = ai === 0 ? 1 : 0, nm = it.label;
+            ui.cmdFeedback = t("cmdCopying");
+            void copyEntry({ host, path: srcPath }, { host: otherHost, path: dstPath }).then((r) => {
+              if (!ui.commander) return;
+              ui.cmdFeedback = r.ok ? `✓ ${nm} → ${other.host}` : `error: ${r.error}`;
+              if (r.ok) listPane(oi);
+              else draw();
+            });
+          } else if (other.view !== "files") {
+            ui.cmdFeedback = "Ziel-Pane muss Dateien zeigen (Tab → .. → Files)";
+          }
+        } else if ((k === "L" || fkey === 4) && (p.view === "files" || p.view === "fleet")) {
           if (host) {
-            const cwd = p.path;
+            const cwd = p.view === "files" ? p.path : (it?.cwd ?? p.path);
             ui.cmdFeedback = t("cmdLaunching");
-            void launchRcServer(host, cwd, { spawn: "worktree", ...rcOpts() }).then((r) => {
+            void launchRcServer(host, cwd, { spawn: "worktree", ...rcOpts(host) }).then((r) => {
               if (!ui.commander) return;
               ui.cmdFeedback = r.ok ? `${r.reused ? "running" : "✓ launched"} @ ${cwd}` : `error: ${r.error}`;
+              if (p.view === "fleet") listPane(ai);
               refreshFleet(host);
               draw();
             });
           }
-        } else if (k === "K") {
+        } else if ((k === "K" || fkey === 7) && (p.view === "files" || p.view === "fleet")) {
           if (host) {
-            const cwd = p.path;
+            const cwd = p.view === "files" ? p.path : (it?.cwd ?? p.path);
             ui.cmdFeedback = "stopping…";
-            void stopRcServer(host, rcOpts().key, cwd).then((ok) => {
+            void stopRcServer(host, rcOpts(host).key, cwd).then((ok) => {
               if (!ui.commander) return;
               ui.cmdFeedback = ok ? `✓ stopped @ ${cwd}` : "no server here";
+              if (p.view === "fleet") listPane(ai);
               refreshFleet(host);
               draw();
             });
           }
-        } else if (k === "a") {
-          if (host) shellOut(shellOutArgv(host, { tmux: tmuxName(rcOpts().key, p.path) }));
+        } else if ((k === "a" || fkey === 6) && p.view === "files") {
+          if (host) shellOut(shellOutArgv(host, { tmux: tmuxName(rcOpts(host).key, p.path) }));
         } else {
           return;
         }
@@ -741,6 +1158,7 @@ function runLoop(): void {
           ui.input = "";
           ui.cockpitArea = "input";
           ui.pendingImages = [];
+          if (ui.fromCommander) { ui.commander = true; ui.fromCommander = false; } // back to the Commander
         } else if (k === "\t") {
           // jump down into the open-questions list
           ui.cockpitArea = "list";
@@ -972,6 +1390,7 @@ function runLoop(): void {
     draw();
   };
 
+  commanderHome(); // mc/nc-style two-pane Commander is the default view (F4 → dashboard)
   draw();
 }
 

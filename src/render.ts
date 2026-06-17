@@ -76,12 +76,23 @@ function pageWrap(line: string, page: RGB): string {
  * the detail/transcript/cockpit views. `accent` tints all edges (focus); without
  * it the edges use the light-top / dark-bottom neutral border.
  */
-function panel(label: string, badge: string, content: string[], innerW: number, surf: Surface, accent?: RGB): string[] {
+function panel(
+  label: string, badge: string, content: string[], innerW: number, surf: Surface, accent?: RGB,
+  selRow = -1, selColor?: RGB,
+): string[] {
   const tint = borderTints(surf, accent);
   const top = `${c(tint.top)}╭${RESET}` + rule(` ${label} `, badge ? ` ${badge} ` : "", innerW, "─", tint.top) + `${c(tint.top)}╮${RESET}`;
   const mids = content.map((l) => `${c(tint.mid)}│${RESET} ` + pad(l, innerW - 2) + ` ${c(tint.mid)}│${RESET}`);
-  const bottom = `${c(tint.btm)}╰${"─".repeat(innerW)}╯${RESET}`;
-  return surfaceBox([top, ...mids, bottom], surf);
+  const rows = [top, ...mids, bottom(tint, innerW)];
+  // Per-row background: the gradient surface, except the selected content row,
+  // which gets a full-width selection bar (the mc/nc cursor).
+  return rows.map((r, i) => {
+    if (selColor && i - 1 === selRow) return bgRow(r, selColor);
+    return bgRow(r, gradientRow(surf, i, rows.length));
+  });
+}
+function bottom(tint: { btm: RGB }, innerW: number): string {
+  return `${c(tint.btm)}╰${"─".repeat(innerW)}╯${RESET}`;
 }
 
 /** Border-edge tints, flattened against the surface they enclose. */
@@ -377,19 +388,63 @@ function headerLines(states: InstanceState[], frame: number, now: number, W: num
   return [rule(`${title} `, ` ${summary}`, W, "━", TH().textDim), ""];
 }
 
-/** One side of the two-pane Commander file browser. */
+/** What a Commander pane is currently showing. `tree` = the Host▸Project▸Session
+ *  agent tree (the Conductor's left spine); `session` = a live session detail. */
+export type PaneView = "tree" | "session" | "hosts" | "drives" | "files" | "accounts" | "sessions" | "fleet";
+
+export type PaneItemKind =
+  | "up" | "host" | "project" | "drive" | "dir" | "file" | "link" | "account" | "session" | "rcserver";
+
+/**
+ * One polymorphic row in a Commander pane — a host, a drive, a dir/file, an
+ * account, a session or an RC server. The renderer draws it by kind; the
+ * navigation payload (host/path/accountKey/sessionId/…) tells index.ts where
+ * "Enter" goes.
+ */
+export interface PaneItem {
+  kind: PaneItemKind;
+  label: string;
+  meta?: string; // right-aligned secondary text (size / load / model / RAM …)
+  state?: SessState; // session rows → state colour + glyph
+  online?: boolean; // host rows → liveness dot
+  // navigation payload (set per kind)
+  host?: string;
+  path?: string;
+  accountKey?: string;
+  sessionId?: string;
+  cwd?: string;
+  drive?: PaneView;
+  pid?: number;
+  tmux?: string; // rcserver rows → tmux session name for attach
+  // tree rows (Conductor left pane):
+  depth?: number; // indent level (host=0, project=1, session=2)
+  badge?: string; // pre-coloured compact status badge ([WAIT] etc.)
+  expandable?: boolean;
+  expanded?: boolean;
+  nodeId?: string; // stable id for the expand/collapse set
+}
+
+/**
+ * One side of the two-pane Commander. A pane is polymorphic: depending on `view`
+ * it lists hosts, drives, files, accounts, sessions or the RC fleet, and you cd
+ * through the hierarchy (Enter descends, ".." ascends). `title` is the
+ * breadcrumb shown in the pane header.
+ */
 export interface CmdPane {
-  host: string; // host name ("" = no host chosen yet)
-  path: string;
-  entries: FsEntry[]; // async-fetched listing of `path`
+  view: PaneView;
+  host: string; // active host name ("" = none yet)
+  path: string; // files view cwd
+  accountKey: string; // sessions view: which account
+  title: string;
+  items: PaneItem[];
   sel: number;
   loading: boolean;
   error: string;
 }
 
-/** A fresh, empty Commander pane. */
+/** A fresh, empty Commander pane (starts at the hosts view). */
 export function emptyPane(): CmdPane {
-  return { host: "", path: "", entries: [], sel: 0, loading: false, error: "" };
+  return { view: "hosts", host: "", path: "", accountKey: "", title: "", items: [], sel: 0, loading: false, error: "" };
 }
 
 export interface UIState {
@@ -423,14 +478,14 @@ export interface UIState {
   // live theme quick-picker (p): scrub to preview, ⏎ commits, Esc restores
   themePicker: boolean;
   themeSel: number;
-  // multi-host Commander (h): Ebene 0 hosts → Ebene 1 two-pane files → control
+  // multi-host Commander — the whole app IS the commander (mc/nc). Each pane is
+  // polymorphic (hosts/drives/files/accounts/sessions/fleet); you cd through it.
   commander: boolean;
-  cmdLevel: "hosts" | "files";
-  cmdHosts: Host[]; // resolved once on entry
-  cmdHostSel: number;
+  cmdHosts: Host[]; // resolved host registry (cache for the builders)
   cmdActive: 0 | 1; // which pane has focus (Tab switches)
-  cmdPanes: [CmdPane, CmdPane]; // left / right file panes
+  cmdPanes: [CmdPane, CmdPane]; // left / right panes
   cmdRemote: RemoteSnapshot | null; // fleet snapshot for the active pane's host
+  fromCommander: boolean; // a full-screen view (cockpit/transcript) was opened from the Commander → Esc returns there
   cmdFeedback: string; // transient result of an action (launch/stop/copy)
   // quick-issue flow (picker === "issue")
   issueStage: "pick" | "drafting" | "review" | "rewrite" | "creating" | "done" | "error";
@@ -1101,7 +1156,9 @@ function renderIssueModal(
   states: InstanceState[], registry: AgentRegistry | undefined, frame: number, now: number,
   W: number, height: number, ui: UIState,
 ): string[] {
-  const backdrop = renderGrid(states, frame, now, W, ui, height, registry);
+  const backdrop = ui.commander
+    ? renderCommander(states, frame, now, W, height, ui)
+    : renderGrid(states, frame, now, W, ui, height, registry);
   const accent = TH().accentHi;
   const B = (ch: string) => `${c(accent)}${ch}${RESET}`;
   const popupW = Math.min(W - 6, 124);
@@ -1245,7 +1302,9 @@ function renderWizard(
   states: InstanceState[], registry: AgentRegistry | undefined, frame: number, now: number,
   W: number, height: number, ui: UIState,
 ): string[] {
-  const backdrop = renderGrid(states, frame, now, W, ui, height, registry);
+  const backdrop = ui.commander
+    ? renderCommander(states, frame, now, W, height, ui)
+    : renderGrid(states, frame, now, W, ui, height, registry);
   const accent = TH().accent;
   const folderMode = ui.pickerMode === "folder";
   const focusLeft = ui.pickerPane === "instance";
@@ -1370,6 +1429,38 @@ function sizeFmt(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(1)}G`;
 }
 
+/** Context-sensitive F1–F10 labels for the active pane's view. */
+function fkeysForView(view: PaneView): [string, string][] {
+  const help: [string, string] = ["1", "Help"];
+  const drv: [string, string] = ["2", "Drives"];
+  const menu: [string, string] = ["9", "Menu"];
+  const quit: [string, string] = ["10", "Quit"];
+  const theme: [string, string] = ["8", "Theme"];
+  switch (view) {
+    case "tree": return [help, ["2", "Waiting"], ["3", "Open"], ["4", "New"], ["5", "Issue"], ["6", "Shell"], ["7", "Restart"], theme, ["9", "Files"], quit];
+    case "session": return [help, ["2", "Waiting"], ["3", "Steer"], ["4", "New"], ["5", " "], ["6", "Shell"], ["7", "Restart"], theme, ["9", "Files"], quit];
+    case "files": return [help, drv, ["3", "Shell"], ["4", "Launch"], ["5", "Copy"], ["6", "Attach"], ["7", "Stop"], theme, menu, quit];
+    case "sessions": return [help, drv, ["3", "Open"], ["4", "Agent"], ["5", "Issue"], ["6", "Rename"], ["7", "Close"], theme, menu, quit];
+    case "accounts": return [help, drv, ["3", "Sessions"], ["4", "Agent"], ["5", "Issue"], ["6", " "], ["7", " "], theme, menu, quit];
+    case "fleet": return [help, drv, ["3", "Attach"], ["4", "Launch"], ["5", " "], ["6", " "], ["7", "Stop"], theme, menu, quit];
+    default: return [help, drv, ["3", "Enter"], ["4", " "], ["5", " "], ["6", " "], ["7", " "], theme, menu, quit];
+  }
+}
+
+/** The classic Midnight/Norton-Commander F1–F10 function-key bar. */
+function fkeyBar(W: number, keys: [string, string][]): string {
+  const th = TH();
+  const cellW = Math.max(7, Math.floor(W / keys.length));
+  let bar = "";
+  for (const [num, label] of keys) {
+    const body = ` ${label}`;
+    const fill = Math.max(0, cellW - num.length - vwidth(body));
+    // number dim + outside, label on a raised "pill" in bright text — the mc look
+    bar += `${cText3()}${num}${RESET}${tbg(th.surface.top)}${cText()}${body}${" ".repeat(fill)}${RESET}`;
+  }
+  return trunc(bar, W);
+}
+
 /** One-line governor bar: PSS usage vs the RAM ceiling, heat-coloured. */
 function governorBar(snap: RemoteSnapshot, w: number): string {
   const th = TH();
@@ -1388,81 +1479,136 @@ function governorBar(snap: RemoteSnapshot, w: number): string {
  * control. Pure render — async listings/snapshots are fetched in index.ts and
  * parked on ui (cmdEntries / cmdRemote), mirroring the issue-flow pattern.
  */
+/** Legible state word (paired with colour) for the detail header. */
+function stateWord(st: SessState): string {
+  return st === "aktiv" ? "WORKING" : st === "wartet" ? "WAITING" : st === "monitor" ? "MONITOR" : "IDLE";
+}
+
+/**
+ * Right-pane detail for the selected tree node. For an agent: its recent
+ * conversation tail (so you read what it's doing / asking without leaving the
+ * tree). For a project/host: a short hint. This is the master-detail "preview".
+ */
+function sessionDetail(it: PaneItem | undefined, width: number, _now: number): string[] {
+  if (!it || it.kind === "up") return ["", `  ${cText3()}↑/↓ select an agent on the left${RESET}`];
+  if (it.kind === "project") return ["", `  ${cAcc()}${ICONS.repo} ${it.label}${RESET}`, "", `  ${cText3()}⏎ expand · F4 new agent · F9 files${RESET}`];
+  if (it.kind === "host") return ["", `  ${cAcc()}${ICONS.host} ${it.label}${RESET}`, "", `  ${cText3()}⏎ expand${RESET}`];
+  if (it.kind !== "session") return ["", `  ${cText3()}↑/↓ select an agent · ⏎ to open it${RESET}`];
+  const v = visual(it.state ?? "stale");
+  const lines: string[] = [
+    `${c(v.color)}${stateWord(it.state ?? "stale")}${RESET}  ${cText2()}${it.accountKey ?? ""}${RESET}  ${cText3()}${tilde(it.cwd ?? "")}${RESET}`,
+    "",
+  ];
+  const segs = it.path ? readTranscript(it.path).slice(-60) : [];
+  if (!segs.length) lines.push(`  ${cText3()}— no transcript yet —${RESET}`);
+  else for (const l of transcriptDisplayLines(segs, width)) lines.push(l);
+  lines.push("", `${cText3()}⏎ steer this agent${RESET}`);
+  return lines;
+}
+
+/** Glyph + colours for one polymorphic pane row. */
+function paneVisual(it: PaneItem): { icon: string; color: RGB; name: RGB; nav: boolean } {
+  const th = TH();
+  switch (it.kind) {
+    case "up": return { icon: ICONS.folder, color: th.accent, name: th.text2, nav: true };
+    case "host": return { icon: ICONS.host, color: it.online === false ? th.textDim : it.online ? th.success : th.text3, name: th.text, nav: true };
+    case "project": return { icon: ICONS.repo, color: th.accent, name: th.text2, nav: true };
+    case "drive": return { icon: ICONS.repo, color: th.accentHi, name: th.text, nav: true };
+    case "dir": return { icon: ICONS.folder, color: th.accent, name: th.text2, nav: true };
+    case "link": return { icon: ICONS.branch, color: th.text3, name: th.text3, nav: true };
+    case "account": return { icon: ICONS.account, color: th.accentHi, name: th.text2, nav: true };
+    case "session": { const v = visual(it.state ?? "stale"); return { icon: v.glyph, color: v.color, name: th.text2, nav: true }; }
+    case "rcserver": return { icon: ICONS.background, color: th.accentHi, name: th.text2, nav: true };
+    default: return { icon: ICONS.file, color: th.text3, name: th.text3, nav: false };
+  }
+}
+
+const PANE_COLS: Record<PaneView, [string, string]> = {
+  tree: ["", ""], session: ["", ""],
+  hosts: ["Host", "Address"], drives: ["Drive", ""], files: ["Name", "Size"],
+  accounts: ["Account", "Load"], sessions: ["Session", "State"], fleet: ["Server", "RAM"],
+};
+
+/**
+ * The whole app: a polymorphic two-pane Commander. Each pane shows one "drive"
+ * (hosts/files/accounts/sessions/fleet) and is rendered uniformly from its
+ * `items`; navigation/listing lives in index.ts. Header breadcrumb + Name/Size-
+ * style column header per view, plus the context F-key bar.
+ */
 function renderCommander(
   states: InstanceState[], frame: number, now: number, W: number, height: number, ui: UIState,
 ): string[] {
   const th = TH();
-  const innerW = W - 2;
-  const textW = innerW - 2;
-  const title = `${BOLD}${cAcc()}${ICONS.host} COMMANDER${RESET}`;
-
-  // ── Ebene 0: hosts ──
-  if (ui.cmdLevel === "hosts") {
-    const hosts = ui.cmdHosts;
-    const sel = clampIdx(ui.cmdHostSel, hosts.length);
-    ui.cmdHostSel = sel;
-    const cells = hosts.map((h, i) => {
-      const on = i === sel;
-      const mark = on ? `${cText()}${ICONS.cursor}${RESET}` : " ";
-      const dot = h.online === false ? `${cText3()}${ICONS.idle}${RESET}`
-        : h.online ? `${cOk()}${ICONS.active}${RESET}` : `${cDim()}${ICONS.tool}${RESET}`;
-      const name = on ? `${BOLD}${cText()}${h.name}${RESET}` : `${cText2()}${h.name}${RESET}`;
-      const left = `${mark} ${dot} ${cAcc()}${ICONS.host}${RESET} ${name}`;
-      const right = `${cText3()}${sshTarget(h)}${RESET}  ${cDim()}${h.source}${h.os ? " · " + h.os : ""}${RESET}`;
-      return spread(left, right, textW);
-    });
-    const out: string[] = [rule(`${title} `, ` ${cText3()}${t("cmdNetwork")} · ${hosts.length}${RESET} `, W, "━", th.textDim), ""];
-    const cap = Math.max(3, height - 6);
-    const { slice, start } = windowAround(cells, sel, cap);
-    const body = ["", ...slice.map((c, i) => {
-      if (i === 0 && start > 0) return `${DIM}  ↑ ${start} ${t("more")}${RESET}`;
-      if (i === slice.length - 1 && start + cap < cells.length) return `${DIM}  ↓ ${cells.length - start - cap} ${t("more")}${RESET}`;
-      return c;
-    }), ""];
-    for (const l of panel(`${cAcc()}${ICONS.host}${RESET} ${t("cmdHosts")}`, "", body, innerW, th.raised, th.accent)) out.push(l);
-    out.push("");
-    out.push(`${cText()}↑/↓${RESET}${DIM} ${t("select")}${RESET}  ${cText()}→/⏎${RESET}${DIM} ${t("cmdEnterHost")}${RESET}  ${cText()}Esc${RESET}${DIM} ${t("back")}${RESET}  ${DIM}[q] ${t("quit")}${RESET}`);
-    return out;
-  }
-
-  // ── Ebene 1: two side-by-side file panes (the literal Commander) ──
   const active = ui.cmdPanes[ui.cmdActive];
-  const out: string[] = [rule(`${title} `, ` ${cText3()}${t("cmdTwoPane")}${RESET} `, W, "━", th.textDim), ""];
-  const boxW = Math.floor((W - 1) / 2); // two boxes + a 1-col gutter span W
-  const pInner = boxW - 2; // panel content width (between the │ borders + the corners)
-  const bodyRows = Math.max(4, height - 8); // shared height so both boxes line up
+  // ── top "who needs me" bar: the single most important glance ──
+  const allSess = states.flatMap((s) => s.sessions);
+  const waitN = allSess.filter((x) => x.state === "wartet").length;
+  const workN = allSess.filter((x) => x.state === "aktiv").length;
+  const clock = new Date(now).toLocaleTimeString(localeTag());
+  const tok5h = states.reduce((a, s) => a + s.block5h.work, 0);
+  const waitStr = waitN
+    ? `${cWarn()}${BOLD}● ${waitN} waiting${RESET}`
+    : `${cText3()}● 0 waiting${RESET}`;
+  const title = `${BOLD}${cAcc()}claudeplex${RESET} ${cText3()}${ICONS.host} ${active.host || "—"}${RESET}`;
+  const summary =
+    `${waitStr}  ${cOk()}${workN} working${RESET}  ` +
+    `${cText3()}${formatTokens(tok5h)} 5h${RESET}  ${cAcc()}${clock}${RESET}`;
+  const menu = `  ${cText3()}File   Agent   Remote   View   Help${RESET}`;
+  const out: string[] = [rule(`${title} `, ` ${summary} `, W, "━", th.textDim), menu, ""];
+  const boxW = Math.floor((W - 1) / 2);
+  const pInner = boxW - 2;
+  const bodyRows = Math.max(4, height - 9);
+
+  // selection bar colours: bright accent bar on the active pane, faint on the other
+  const selActive = lerp(th.raised.top, th.accent, 0.34);
+  const selIdle = lerp(th.raised.top, th.text3, 0.16);
 
   const renderPane = (p: CmdPane, idx: number): string[] => {
     const isActive = idx === ui.cmdActive;
-    const accent = isActive ? th.accent : undefined; // active pane = accent border
-    const hostLbl = p.host || `(${t("cmdPickHost")})`;
-    const label = `${isActive ? cAcc() : cText3()}${ICONS.host} ${trunc(hostLbl, pInner - 4)}${RESET}`;
+    const accent = isActive ? th.accent : undefined;
+    // ── session detail view: mirror the LEFT tree's selected agent (master-detail) ──
+    if (p.view === "session") {
+      const lp = ui.cmdPanes[0];
+      const selItem = lp.items[clampIdx(lp.sel, lp.items.length)];
+      const isSess = selItem?.kind === "session";
+      const slabel = isSess ? `${cAcc()}${trunc(selItem.label, pInner - 2)}${RESET}` : `${cText3()}Agent${RESET}`;
+      const det = sessionDetail(selItem, pInner - 2, now);
+      const view = det.slice(-bodyRows);
+      while (view.length < bodyRows) view.unshift(""); // newest pinned to the bottom (chat-like)
+      return panel(slabel, "", view, pInner, th.sunken, accent);
+    }
+    const label = `${isActive ? cAcc() : cText3()}${trunc(p.title || t("cmdNetwork"), pInner - 2)}${RESET}`;
     let content: string[];
-    if (!p.host) content = ["", `  ${cText3()}${ICONS.prompt} ${t("cmdPickHost")}${RESET}`];
-    else if (p.loading) content = [`${cText3()}${pathCol(p.path, pInner - 2)}${RESET}`, "", `  ${cText3()}${SPINNER[frame % SPINNER.length]} ${t("cmdLoading")}${RESET}`];
+    let selRow = -1;
+    if (p.loading) content = ["", `  ${cText3()}${SPINNER[frame % SPINNER.length]} ${t("cmdLoading")}${RESET}`];
     else if (p.error) content = ["", ...wrap(p.error, pInner - 4, 4).map((l) => `  ${cErr()}${l}${RESET}`)];
     else {
-      const list: FsEntry[] = [{ name: "..", type: "dir", size: 0, mtime: 0 }, ...p.entries];
-      const sel = clampIdx(p.sel, list.length);
-      const cells = list.map((e, i) => {
-        const on = isActive && i === sel;
-        const mark = on ? `${cText()}${ICONS.cursor}${RESET}` : " ";
-        const icon = e.type === "dir" ? `${cAcc()}${ICONS.folder}${RESET}`
-          : e.type === "link" ? `${cText3()}${ICONS.branch}${RESET}` : `${cText3()}${ICONS.file}${RESET}`;
-        const nm = on ? `${BOLD}${cText()}${e.name}${RESET}` : e.type === "dir" ? `${cText2()}${e.name}${RESET}` : `${cText3()}${e.name}${RESET}`;
-        const meta = e.name === ".." ? "" : `${cDim()}${e.type === "dir" ? "" : sizeFmt(e.size)}${RESET}`;
-        return spread(`${mark} ${icon} ${nm}`, meta, pInner - 2);
+      const sel = clampIdx(p.sel, p.items.length);
+      const cells = p.items.map((it, i) => {
+        const onSel = i === sel;
+        const v = paneVisual(it);
+        // tree rows carry an indent + an expand caret; flat rows get a leading space
+        const indent = "  ".repeat(it.depth ?? 0);
+        const caret = it.expandable ? (it.expanded ? "▾" : "▸") : " ";
+        const lead = `${indent}${cText3()}${caret}${RESET}`;
+        // selected row → bright text on the bar; else the per-kind name colour
+        const nm = onSel ? `${BOLD}${cText()}${it.label}${RESET}` : `${tfg(v.name)}${it.label}${RESET}`;
+        const meta = it.badge ?? it.meta ?? ""; // builder pre-colours badge/meta
+        return spread(`${lead} ${tfg(v.color)}${v.icon}${RESET} ${nm}`, meta, pInner - 2);
       });
       const cap = Math.max(1, bodyRows - 1);
-      const { slice, start } = windowAround(cells, isActive ? sel : 0, cap);
-      content = [`${cText3()}${pathCol(p.path, pInner - 2)}${RESET}`, ...slice.map((c, i) => {
+      const { slice, start } = windowAround(cells, sel, cap);
+      const [c1, c2] = PANE_COLS[p.view];
+      const colHdr = spread(`${cText3()}${c1}${RESET}`, `${cText3()}${c2}${RESET}`, pInner - 2);
+      content = [colHdr, ...slice.map((cell, i) => {
         if (i === 0 && start > 0) return `${DIM}  ↑ ${start}${RESET}`;
         if (i === slice.length - 1 && start + cap < cells.length) return `${DIM}  ↓ ${cells.length - start - cap}${RESET}`;
-        return c;
+        return cell;
       })];
+      selRow = 1 + (sel - start); // header offset + position within the window
     }
     while (content.length < bodyRows) content.push("");
-    return panel(label, "", content.slice(0, bodyRows), pInner, th.raised, accent);
+    return panel(label, "", content.slice(0, bodyRows), pInner, th.raised, accent, selRow, isActive ? selActive : selIdle);
   };
 
   const left = renderPane(ui.cmdPanes[0], 0);
@@ -1470,13 +1616,12 @@ function renderCommander(
   const rows = Math.max(left.length, right.length);
   for (let i = 0; i < rows; i++) out.push((left[i] ?? "") + " " + (right[i] ?? ""));
 
-  if (ui.cmdFeedback) out.push(`  ${cAccHi()}${trunc(ui.cmdFeedback, W - 4)}${RESET}`);
-  if (ui.cmdRemote) out.push(governorBar(ui.cmdRemote, W)); // active pane's host
-  out.push(
-    `${cText()}↑/↓${RESET}${DIM} ${t("select")}${RESET}  ${cText()}→/⏎${RESET}${DIM} ${t("cmdOpenDir")}${RESET}  ${cText()}←${RESET}${DIM} ${t("cmdUp")}${RESET}  ` +
-    `${cText()}Tab${RESET}${DIM} ${t("cmdSwitch")}${RESET}  ${cText()}[c]${RESET}${DIM} ${t("cmdCopy")}→${RESET}  ` +
-    `${cText()}[s]${RESET}${DIM} ${t("cmdShell")}${RESET}  ${cText()}[L]${RESET}${DIM} ${t("cmdLaunchRc")}${RESET}  ${cText()}[K]${RESET}${DIM} ${t("cmdKill")}${RESET}  ${cText()}[a]${RESET}${DIM} ${t("cmdAttach")}${RESET}  ${cText()}Esc${RESET}${DIM} ${t("cmdHostsBack")}${RESET}`,
-  );
+  const hint = active.view === "tree" || active.view === "session"
+    ? `${cText3()}↑↓ move · ⏎ open/steer · → expand · ← collapse · ${cText2()}w next-waiting${RESET}${cText3()} · n new · Tab pane${RESET}`
+    : `${cText3()}↑↓ move · ⏎ open · ← up · Tab pane · F9 back to agents${RESET}`;
+  out.push(ui.cmdFeedback ? `  ${cAccHi()}${trunc(ui.cmdFeedback, W - 4)}${RESET}` : `  ${hint}`);
+  if (ui.cmdRemote) out.push(governorBar(ui.cmdRemote, W));
+  out.push(fkeyBar(W, fkeysForView(active.view)));
   return out;
 }
 
@@ -1489,7 +1634,9 @@ function renderThemePicker(
   states: InstanceState[], frame: number, now: number, W: number, height: number, ui: UIState,
   registry?: AgentRegistry,
 ): string[] {
-  const backdrop = renderGrid(states, frame, now, W, ui, height, registry);
+  const backdrop = ui.commander
+    ? renderCommander(states, frame, now, W, height, ui)
+    : renderGrid(states, frame, now, W, ui, height, registry);
   const th = TH();
   const popupW = Math.min(W - 6, 52);
   const innerW = popupW - 2;
@@ -1600,20 +1747,21 @@ export function render(
     picker: "", pickerInput: "", pickerSel: 0, pickerInstance: "", pickerPane: "instance", pickerInstSel: 0,
     pickerMode: "instance", gridRegion: "cards", collapsed: { cards: false, live: false, questions: false }, closeArm: "", renaming: "",
     themePicker: false, themeSel: 0,
-    commander: false, cmdLevel: "hosts", cmdHosts: [], cmdHostSel: 0, cmdActive: 0,
-    cmdPanes: [emptyPane(), emptyPane()], cmdRemote: null, cmdFeedback: "",
+    commander: false, cmdHosts: [], cmdActive: 0,
+    cmdPanes: [emptyPane(), emptyPane()], cmdRemote: null, cmdFeedback: "", fromCommander: false,
     issueStage: "pick", issuePane: "folder", issueFolderSel: 0, issueInput: "", issueFeedback: "",
     issueDraft: "", issueScroll: 0, issueRepo: "", issueInstance: "", issueUrl: "", issueError: "",
   };
+  // Overlays + full-screen views win over the Commander (the default surface).
   let out: string[];
-  if (state.commander) out = renderCommander(states, frame, now, W, height, state);
-  else if (state.themePicker) out = renderThemePicker(states, frame, now, W, height, state, registry);
+  if (state.themePicker) out = renderThemePicker(states, frame, now, W, height, state, registry);
   else if (state.picker === "issue") out = renderIssueModal(states, registry, frame, now, W, height, state);
   else if (state.picker === "wizard") out = renderWizard(states, registry, frame, now, W, height, state);
   else if (state.picker === "cwd") out = renderPicker(states, frame, now, W, height, state);
   else if (state.cockpit && registry) out = renderCockpit(states, registry, frame, now, W, height, state);
   else if (state.expanded && state.transcript) out = renderTranscript(states, frame, now, W, height, state);
   else if (state.expanded) out = renderDetail(states, frame, now, W, state);
+  else if (state.commander) out = renderCommander(states, frame, now, W, height, state);
   else out = renderGrid(states, frame, now, W, state, height, registry);
   return onPage(out);
 }

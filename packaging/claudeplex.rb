@@ -10,7 +10,7 @@
 class Claudeplex < Formula
   desc "Terminal multiplexer & cockpit for Claude Code — monitor & orchestrate Claude accounts"
   homepage "https://github.com/iret77/claudeplex"
-  version "0.3.0"
+  version "0.3.1"
   license "MIT"
 
   on_macos do
