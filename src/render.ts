@@ -155,8 +155,10 @@ function planChip(plan: string): string {
 
 /** Right-align `right` after `left` within `width` (space filler). */
 function spread(left: string, right: string, width: number): string {
-  const inner = Math.max(0, width - vwidth(right));
-  return pad(left, inner) + right;
+  const rw = vwidth(right);
+  const inner = Math.max(0, width - rw);
+  const gap = rw > 0 ? 1 : 0; // always keep ≥1 space so a full-width left never abuts the right column
+  return pad(trunc(left, Math.max(0, inner - gap)), inner) + right;
 }
 
 function statTrail(t: WindowTotals, withMsg: boolean): string {
@@ -1814,7 +1816,7 @@ function renderCommander(
   for (let i = 0; i < rows; i++) out.push((left[i] ?? "") + " " + (right[i] ?? ""));
 
   const hint = active.view === "tree" || active.view === "session"
-    ? `${cText3()}↑↓ move · ⏎ open/steer · → expand · ← collapse · ${cText2()}w next-waiting${RESET}${cText3()} · n new · Tab pane${RESET}`
+    ? `${cText3()}↑↓ move · ⏎ open/steer · → expand · ← collapse · ${cText2()}w next-waiting${RESET}${cText3()} · n new · P pr · p theme · Tab pane${RESET}`
     : `${cText3()}↑↓ move · ⏎ open · ← up · Tab pane · F9 back to agents${RESET}`;
   out.push(ui.cmdFeedback ? `  ${cAccHi()}${trunc(ui.cmdFeedback, W - 4)}${RESET}` : `  ${hint}`);
   if (ui.cmdRemote) out.push(governorBar(ui.cmdRemote, W));

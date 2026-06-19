@@ -27,7 +27,12 @@ export interface Host {
   os?: string;
 }
 
-/** Parse ~/.ssh/config into hosts. Wildcard patterns (Host *, ?) are skipped. */
+/** Git-forge endpoints: ssh-config aliases that point here are deploy-key
+ *  remotes for `git push`, not machines to shell into — kept out of the tree. */
+const GIT_FORGE = /^(.*\.)?(github\.com|gitlab\.com|bitbucket\.org|codeberg\.org|ssh\.dev\.azure\.com|git\.sr\.ht)$/i;
+
+/** Parse ~/.ssh/config into hosts. Wildcard patterns (Host *, ?) and git-forge
+ *  aliases (github.com etc.) are skipped — they aren't interactive hosts. */
 function fromSshConfig(): Host[] {
   let text: string;
   try {
@@ -44,7 +49,9 @@ function fromSshConfig(): Host[] {
   const flush = () => {
     for (const a of aliases) {
       if (a.includes("*") || a.includes("?")) continue; // patterns aren't connectable hosts
-      out.push({ name: a, hostname: hostName || a, user, port, source: "ssh-config" });
+      const target = hostName || a;
+      if (GIT_FORGE.test(target)) continue; // deploy-key alias for a git remote, not a shell host
+      out.push({ name: a, hostname: target, user, port, source: "ssh-config" });
     }
   };
 

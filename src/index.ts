@@ -927,7 +927,7 @@ function runLoop(): void {
           ui.cmdFeedback = "↑↓ move · ⏎ open/steer · → expand · ← collapse · w next-waiting · Tab pane · n new · i issue · P pr · s shell · F9 files · F8 theme · q quit";
           return draw();
         }
-        if (fkey === 8) {
+        if (fkey === 8 || k === "p") { // F8 or p → live theme picker
           themeOrig = getTheme().name;
           ui.themeSel = themeIndex();
           ui.themePicker = true;
