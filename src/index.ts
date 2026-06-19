@@ -18,6 +18,7 @@ import { discoverHosts, isLocal, sshTarget, type Host } from "./hosts.ts";
 import { tfg, ICONS, RESET } from "./ui.ts";
 import { listDir, resolveHome, pathJoin, shellOutArgv, copyEntry } from "./ssh.ts";
 import { pickFreeInstance, draftIssue, createIssue, splitDraft, isError } from "./issue.ts";
+import { listPRs, analyzePR, reviewPR, mergePR, isPrError, type ReviewEvent } from "./pr.ts";
 
 /** Put the host terminal window into native macOS fullscreen (best-effort). */
 function enterFullscreen(): void {
@@ -116,6 +117,9 @@ function runLoop(): void {
     cmdPanes: [emptyPane(), emptyPane()], cmdRemote: null, cmdFeedback: "", fromCommander: false,
     issueStage: "pick", issuePane: "folder", issueFolderSel: 0, issueInput: "", issueFeedback: "",
     issueDraft: "", issueScroll: 0, issueRepo: "", issueInstance: "", issueUrl: "", issueError: "",
+    prStage: "pick", prPane: "repo", prRepoSel: 0, prPrSel: 0, prList: [], prRepoCwd: "",
+    prInstance: "", prAnalysis: null, prPendingAction: null, prActionInput: "", prResult: "",
+    prError: "", prScroll: 0, prStart: 0, prToken: 0,
   };
   const registry = new AgentRegistry();
   let issueToken = 0; // bumped on each draft/create/open to ignore stale async results
@@ -232,6 +236,144 @@ function runLoop(): void {
         ui.issueStage = "done";
       }
     });
+  };
+
+  // ── PR-review (picker === "pr") — structural twin of the quick-issue flow ──
+
+  /** Load a repo's open PRs into the right pane (lazy, on repo change). */
+  const loadPrList = async (cwd: string): Promise<void> => {
+    const token = ++ui.prToken;
+    ui.prRepoCwd = cwd;
+    ui.prList = [];
+    ui.prPrSel = 0;
+    ui.prError = "";
+    ui.prStage = "pick";
+    const res = await listPRs(cwd);
+    if (token !== ui.prToken || ui.picker !== "pr") return; // superseded or closed
+    if (isPrError(res)) {
+      ui.prStage = "error";
+      ui.prError = res.error;
+    } else {
+      ui.prList = res;
+      ui.prPrSel = 0;
+    }
+    draw();
+  };
+
+  /** Open the PR-review modal: pick a repo, load its open PRs, then analyze one. */
+  const openPr = (): void => {
+    ui.prToken++; // invalidate any in-flight load/analyze
+    ui.picker = "pr";
+    ui.prStage = "pick";
+    ui.prPane = "repo";
+    ui.prRepoSel = 0;
+    ui.prPrSel = 0;
+    ui.prList = [];
+    ui.prAnalysis = null;
+    ui.prResult = "";
+    ui.prError = "";
+    ui.prScroll = 0;
+    const repos = issueRepos(states);
+    if (repos[0]) void loadPrList(repos[0].cwd);
+  };
+
+  /** Analyze the selected PR on the freest idle instance; async → review/error. */
+  const startAnalyze = (): void => {
+    const pr = ui.prList[Math.min(ui.prPrSel, Math.max(0, ui.prList.length - 1))];
+    if (!pr) return;
+    const inst = pickFreeInstance(states, registry);
+    if (!inst) {
+      ui.prStage = "error";
+      ui.prError = t("noInstances");
+      return;
+    }
+    ui.prInstance = inst.def.key;
+    ui.prStage = "analyzing";
+    ui.prScroll = 0;
+    ui.prStart = Date.now(); // headless one-shot → elapsed timer, no live stream
+    const token = ++ui.prToken;
+    void analyzePR(inst.def, ui.prRepoCwd, pr).then((r) => {
+      if (token !== ui.prToken || ui.picker !== "pr") return;
+      if (isPrError(r)) {
+        ui.prStage = "error";
+        ui.prError = r.error;
+      } else {
+        ui.prAnalysis = r;
+        ui.prStage = "review";
+        ui.prScroll = 0;
+      }
+      draw();
+    });
+  };
+
+  /** Post a PR review (approve/comment/request-changes) via gh; async → done/error. */
+  const runReview = (event: ReviewEvent, body?: string): void => {
+    const a = ui.prAnalysis;
+    if (!a) return;
+    ui.prStage = "commenting";
+    ui.prStart = Date.now();
+    const token = ++ui.prToken;
+    void reviewPR(ui.prRepoCwd, a.pr.number, event, body).then((r) => {
+      if (token !== ui.prToken || ui.picker !== "pr") return;
+      if (isPrError(r)) {
+        ui.prStage = "error";
+        ui.prError = r.error;
+      } else {
+        ui.prResult = t("prReviewed");
+        ui.prStage = "done";
+      }
+      draw();
+    });
+  };
+
+  /** Merge the reviewed PR via gh (squash, post-confirmation); async → done/error. */
+  const runMerge = (): void => {
+    const a = ui.prAnalysis;
+    if (!a) return;
+    ui.prStage = "merging";
+    ui.prStart = Date.now();
+    const token = ++ui.prToken;
+    void mergePR(ui.prRepoCwd, a.pr.number, "squash").then((r) => {
+      if (token !== ui.prToken || ui.picker !== "pr") return;
+      if (isPrError(r)) {
+        ui.prStage = "error";
+        ui.prError = r.error;
+      } else {
+        ui.prResult = t("prMerged");
+        ui.prStage = "done";
+      }
+      draw();
+    });
+  };
+
+  /**
+   * Launch a session to keep working on the PR: spawn an agent in the repo on the
+   * analyzing instance and pre-fill the cockpit input with a kickoff prompt (the
+   * user presses ⏎ to send — a built-in review step before the agent runs).
+   */
+  const startPrSession = (): void => {
+    const a = ui.prAnalysis;
+    if (!a) return;
+    const inst = states.find((s) => s.def.key === ui.prInstance) ?? pickFreeInstance(states, registry);
+    if (!inst) {
+      ui.prStage = "error";
+      ui.prError = t("noInstances");
+      return;
+    }
+    const cwd = isDir(ui.prRepoCwd) ? ui.prRepoCwd : (process.env.HOME || ".");
+    const seed = [
+      `Bitte bearbeite GitHub PR #${a.pr.number} ("${a.pr.title}") in diesem Repo weiter.`,
+      `Checke ihn aus: \`gh pr checkout ${a.pr.number}\`.`,
+      a.summary ? `Review-Zusammenfassung: ${a.summary}` : "",
+      ...(a.findings.length
+        ? ["Findings:", ...a.findings.map((f) => `- [${f.category}/${f.severity}] ${f.title}${f.location ? ` (${f.location})` : ""}: ${f.detail}`)]
+        : []),
+    ].filter(Boolean).join("\n");
+    ui.focus = `a:${registry.launch(inst.def, cwd).launchId}`;
+    ui.input = seed; // pre-filled kickoff — ⏎ sends
+    ui.picker = "";
+    ui.cockpit = true;
+    ui.cockpitArea = "input";
   };
 
   // ── Commander (multi-host, mc/nc) — the whole app is the commander ──
@@ -766,7 +908,9 @@ function runLoop(): void {
       }
 
       // Commander: Ebene 0 hosts → Ebene 1 two-pane files (copy/shell-out/RC control).
-      if (ui.commander) {
+      // A modal picker (wizard/cwd/issue/pr) opened from the Commander overlays it
+      // and must own the keyboard — defer to the picker blocks below.
+      if (ui.commander && !ui.picker) {
         if (k === "q" || k === "\x03" || fkey === 10) return quit(); // q / Ctrl-C / F10
         const ai = ui.cmdActive;
         const p = ui.cmdPanes[ai];
@@ -780,7 +924,7 @@ function runLoop(): void {
 
         // ── global keys (any view) ──
         if (fkey === 1) {
-          ui.cmdFeedback = "↑↓ move · ⏎ open/steer · → expand · ← collapse · w next-waiting · Tab pane · n new · s shell · F9 files · F8 theme · q quit";
+          ui.cmdFeedback = "↑↓ move · ⏎ open/steer · → expand · ← collapse · w next-waiting · Tab pane · n new · i issue · P pr · s shell · F9 files · F8 theme · q quit";
           return draw();
         }
         if (fkey === 8) {
@@ -808,6 +952,7 @@ function runLoop(): void {
           else if (k === "f" || fkey === 9) toggleRight();
           else if (k === "n" || fkey === 4) newAgentHere(sel);
           else if (k === "i" || fkey === 5) openIssue();
+          else if (k === "P") openPr(); // capital P → PR-review (p is the theme picker)
           else if (k === "s" || fkey === 6) shellHere(sel);
           else return;
           return draw();
@@ -844,6 +989,8 @@ function runLoop(): void {
           openWizard(); // F4 → new-agent wizard
         } else if (fkey === 5 && (p.view === "sessions" || p.view === "accounts")) {
           openIssue(); // F5 → quick-issue
+        } else if (k === "P" && (p.view === "sessions" || p.view === "accounts")) {
+          openPr(); // capital P → PR-review (p is the theme picker)
         } else if (fkey === 3 && p.view !== "files") {
           enterItem(ai); // F3 = Open/Enter/Attach in non-file views
         } else if ((k === "s" || fkey === 3) && p.view === "files") {
@@ -1119,6 +1266,84 @@ function runLoop(): void {
         return draw();
       }
 
+      // PR-review modal: pick → analyze → review → act, a small stage machine.
+      if (ui.picker === "pr") {
+        if (k === "\x03") return quit();
+
+        // Async stages: only cancel is meaningful while the instance / gh runs.
+        if (ui.prStage === "analyzing" || ui.prStage === "commenting" || ui.prStage === "merging" || ui.prStage === "launching") {
+          if (ESC) {
+            ui.prToken++; // abandon the in-flight result
+            ui.picker = "";
+          }
+          return draw();
+        }
+
+        if (ui.prStage === "pick") {
+          const repos = issueRepos(states);
+          const repoCwd = () => repos[Math.min(ui.prRepoSel, Math.max(0, repos.length - 1))]?.cwd;
+          if (ESC) {
+            ui.picker = "";
+          } else if (k === "\t") {
+            ui.prPane = ui.prPane === "repo" ? "list" : "repo";
+          } else if (ui.prPane === "repo") {
+            if (UP) { ui.prRepoSel = Math.max(0, ui.prRepoSel - 1); const c = repoCwd(); if (c) void loadPrList(c); }
+            else if (DOWN) { ui.prRepoSel = Math.min(Math.max(0, repos.length - 1), ui.prRepoSel + 1); const c = repoCwd(); if (c) void loadPrList(c); }
+            else if (RIGHT || ENTER) ui.prPane = "list";
+            else return;
+          } else {
+            // PR list pane: ← back to repos, ⏎ analyzes the highlighted PR
+            if (LEFT) ui.prPane = "repo";
+            else if (UP) ui.prPrSel = Math.max(0, ui.prPrSel - 1);
+            else if (DOWN) ui.prPrSel = Math.min(Math.max(0, ui.prList.length - 1), ui.prPrSel + 1);
+            else if (ENTER) { if (ui.prList[ui.prPrSel]) startAnalyze(); }
+            else return;
+          }
+          return draw();
+        }
+
+        if (ui.prStage === "review") {
+          if (ESC) ui.picker = "";
+          else if (k === "a" || k === "A") runReview("approve");
+          else if (k === "c" || k === "C") { ui.prPendingAction = "comment"; ui.prStage = "action-input"; ui.prActionInput = ""; }
+          else if (k === "r" || k === "R") { ui.prPendingAction = "request-changes"; ui.prStage = "action-input"; ui.prActionInput = ""; }
+          else if (k === "m" || k === "M") runMerge();
+          else if (k === "s" || k === "S") startPrSession();
+          else if (UP) ui.prScroll = Math.max(0, ui.prScroll - 1);
+          else if (DOWN) ui.prScroll += 1; // clamped in render
+          else if (PGUP) ui.prScroll = Math.max(0, ui.prScroll - page);
+          else if (PGDN) ui.prScroll += page;
+          else return;
+          return draw();
+        }
+
+        if (ui.prStage === "action-input") {
+          if (ESC) { ui.prStage = "review"; ui.prActionInput = ""; }
+          else if (ENTER) {
+            const ev: ReviewEvent = ui.prPendingAction === "request-changes" ? "request-changes" : "comment";
+            runReview(ev, ui.prActionInput.trim() || undefined);
+          } else if (k === "\x7f" || k === "\b") {
+            ui.prActionInput = ui.prActionInput.slice(0, -1);
+          } else if (k.length > 0 && ![...k].some((ch) => ch.charCodeAt(0) < 0x20)) {
+            ui.prActionInput += k;
+          } else {
+            return;
+          }
+          return draw();
+        }
+
+        if (ui.prStage === "done") {
+          if (ESC || ENTER) ui.picker = "";
+          return draw();
+        }
+
+        // error stage: r restarts at the picker, Esc closes
+        if (k === "r" || k === "R") { ui.prStage = "pick"; ui.prError = ""; }
+        else if (ESC) ui.picker = "";
+        else return;
+        return draw();
+      }
+
 
       // Cockpit: input-bar mode. Printable keys type into ui.input, so the
       // global quit/refresh letters below must NOT fire here.
@@ -1321,6 +1546,8 @@ function runLoop(): void {
           openWizard(); // 2-pane modal: instance (with load) | working-folder
         } else if (k === "i") {
           openIssue(); // quick-issue: pick repo + describe → draft on a free instance
+        } else if (k === "P") {
+          openPr(); // capital P → PR-review (lowercase p is the theme picker)
         } else if (k === "p") {
           themeOrig = getTheme().name; // live theme picker (preview + persist)
           ui.themeSel = themeIndex();

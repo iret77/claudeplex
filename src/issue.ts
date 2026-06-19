@@ -23,6 +23,14 @@ export interface IssueError {
   error: string;
 }
 
+/** Live progress of a one-shot run. The headless `-p` path reports only the
+ *  final result; kept as a typed surface for the review UI. */
+export interface OneShotProgress {
+  outTokens: number;
+  tools: number;
+  activity: string;
+}
+
 export function isError<T extends object>(r: T | IssueError): r is IssueError {
   return (r as IssueError).error !== undefined;
 }
@@ -116,16 +124,17 @@ function extractResult(stdout: string): string {
 }
 
 /**
- * Draft the issue on the given instance via a headless `claude -p` one-shot,
- * with the repo as cwd so the instance can read the real code.
+ * Run a single headless `claude -p` turn on the given instance and return its
+ * final text. The repo is the cwd so the instance can read real code and run
+ * gh; the login is pinned via a scrubbed env. Resolves to a typed { error }
+ * instead of throwing. Headless is pool-billed but zero-dependency and
+ * cross-platform — sufficient for the drafting/analysis one-shots.
  */
-export async function draftIssue(
+export async function runHeadlessOneShot(
   def: InstanceDef,
   cwd: string,
-  description: string,
-  prior?: { draft: string; feedback: string },
-): Promise<IssueDraft | IssueError> {
-  const prompt = issueDraftPrompt(description, prior);
+  prompt: string,
+): Promise<{ text: string } | IssueError> {
   let proc: import("bun").Subprocess<"ignore", "pipe", "pipe">;
   try {
     proc = Bun.spawn(
@@ -144,7 +153,22 @@ export async function draftIssue(
     const tail = err.trim().split("\n").slice(-3).join(" ").trim();
     return { error: `claude exited ${code}${tail ? `: ${tail}` : ""}` };
   }
-  const raw = extractResult(out);
+  return { text: extractResult(out) };
+}
+
+/**
+ * Draft the issue on the given instance via a headless `claude -p` one-shot,
+ * with the repo as cwd so the instance can read the real code.
+ */
+export async function draftIssue(
+  def: InstanceDef,
+  cwd: string,
+  description: string,
+  prior?: { draft: string; feedback: string },
+): Promise<IssueDraft | IssueError> {
+  const r = await runHeadlessOneShot(def, cwd, issueDraftPrompt(description, prior));
+  if (isError(r)) return r;
+  const raw = r.text;
   if (!raw) return { error: "the instance returned an empty draft" };
   const { title, body } = splitDraft(raw);
   if (!title) return { error: "draft had no title line" };

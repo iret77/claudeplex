@@ -18,6 +18,7 @@ import { dirSuggestions, expandTilde, isDir } from "./paths.ts";
 import { renderMarkdown } from "./markdown.ts";
 import { t, stateLabel, localeTag } from "./i18n.ts";
 import { repoSlug, repoLabel, repoParts } from "./git.ts";
+import type { PullRequest, PrAnalysis } from "./pr.ts";
 import { homedir } from "node:os";
 
 const HOME = homedir();
@@ -462,7 +463,7 @@ export interface UIState {
   pendingImages: { mediaType: string; data: string }[]; // clipboard images to send with the next message
   // new-agent picker: "wizard" = 2-pane modal (instance | folder);
   // "cwd" = single folder picker for quick-launch on a known instance
-  picker: "" | "cwd" | "wizard" | "issue"; // active picker ("" = none)
+  picker: "" | "cwd" | "wizard" | "issue" | "pr"; // active picker ("" = none)
   pickerInput: string; // editable path buffer
   pickerSel: number; // highlighted folder-suggestion index
   pickerInstance: string; // instance key the agent will launch into
@@ -499,6 +500,22 @@ export interface UIState {
   issueInstance: string; // instance key chosen to draft
   issueUrl: string; // created issue URL (done stage)
   issueError: string; // error message (error stage)
+  // pr-review flow (picker === "pr"): pick → analyze → review → act
+  prStage: "pick" | "analyzing" | "review" | "action-input" | "commenting" | "merging" | "launching" | "done" | "error";
+  prPane: "repo" | "list"; // which pick-stage pane has focus
+  prRepoSel: number; // highlighted repo index
+  prPrSel: number; // highlighted PR index
+  prList: PullRequest[]; // open PRs for the selected repo
+  prRepoCwd: string; // chosen repo cwd
+  prInstance: string; // instance key chosen to analyze
+  prAnalysis: PrAnalysis | null; // analysis result (review stage)
+  prPendingAction: "comment" | "request-changes" | null; // which review the action-input feeds
+  prActionInput: string; // review-body buffer (action-input stage)
+  prResult: string; // success message (done stage)
+  prError: string; // error message (error stage)
+  prScroll: number; // scroll offset in the review modal
+  prStart: number; // epoch ms when the current async stage began (elapsed timer)
+  prToken: number; // bumped to cancel stale async results
 }
 
 /** Sessions across all instances whose turn ended and that await input. */
@@ -1291,6 +1308,186 @@ function renderIssueModal(
 }
 
 /**
+ * PR-Review modal: a centered popup that drives the whole pick → analyze → act
+ * flow (stage held in ui.prStage). Structural twin of renderIssueModal, skinned
+ * with the same theme tokens.
+ *  - pick:      left = repos we've worked in, right = that repo's open PRs.
+ *  - analyzing: spinner + elapsed seconds while a free instance analyzes the PR
+ *               (analyzePR is headless `claude -p` — no live token/tool stream).
+ *  - review:    color-coded verdict header + findings + Markdown report; act bar.
+ *  - action-input: optional review body for comment / request-changes.
+ *  - commenting/merging/launching: spinner while gh / the launch runs.
+ *  - done/error: result message or a clear error.
+ */
+function renderPrModal(
+  states: InstanceState[], registry: AgentRegistry | undefined, frame: number, now: number,
+  W: number, height: number, ui: UIState,
+): string[] {
+  const backdrop = ui.commander
+    ? renderCommander(states, frame, now, W, height, ui)
+    : renderGrid(states, frame, now, W, ui, height, registry);
+  const accent = TH().accentHi;
+  const B = (ch: string) => `${c(accent)}${ch}${RESET}`;
+  const popupW = Math.min(W - 6, 124);
+  const innerW = popupW - 2;
+  const textW = innerW - 2;
+  const bodyRows = Math.min(Math.max(8, height - 12), 24);
+  const spin = SPINNER[frame % SPINNER.length];
+  const title = `${c(accent)}${BOLD}${ICONS.branch} ${t("prTitle")}${RESET}`;
+
+  const place = (box: string[]): string[] => {
+    const top = Math.max(2, Math.floor((height - box.length) / 2));
+    const left = Math.max(0, Math.floor((W - popupW) / 2));
+    return overlayBox(backdrop, surfaceBox(box, TH().raised), top, left);
+  };
+  const frameBox = (rows: string[], tag: string, hint: string): string[] => {
+    const box: string[] = [];
+    box.push(B("╭") + rule(` ${title} `, ` ${tag} `, innerW, "─", accent) + B("╮"));
+    for (let i = 0; i < bodyRows; i++) box.push(B("│") + " " + pad(rows[i] ?? "", textW) + " " + B("│"));
+    box.push(B("├") + `${c(accent)}${"─".repeat(innerW)}${RESET}` + B("┤"));
+    box.push(B("│") + " " + pad(hint, textW) + " " + B("│"));
+    box.push(B("╰") + `${c(accent)}${"─".repeat(innerW)}${RESET}` + B("╯"));
+    return place(box);
+  };
+  const centered = (mid: string[]): string[] => {
+    const top = Math.max(0, Math.floor((bodyRows - mid.length) / 2));
+    return [...Array(top).fill(""), ...mid];
+  };
+  const caret = Math.floor(frame / 3) % 2 === 0 ? `${cText()}▏${RESET}` : " ";
+  const riskColor = (r: PrAnalysis["riskLevel"]): RGB =>
+    r === "high" ? TH().error : r === "low" ? TH().success : TH().warning;
+  const recColor = (r: PrAnalysis["mergeRecommendation"]): RGB =>
+    r === "merge" ? TH().success : r === "do-not-merge" ? TH().error
+      : r === "changes-requested" ? TH().warning : TH().text3;
+
+  // ── pick: repo (left) + open PRs (right) ──
+  if (ui.prStage === "pick") {
+    const repos = issueRepos(states);
+    const rsel = clampIdx(ui.prRepoSel, repos.length);
+    ui.prRepoSel = rsel;
+    const psel = clampIdx(ui.prPrSel, ui.prList.length);
+    ui.prPrSel = psel;
+    const focusLeft = ui.prPane === "repo";
+    const div = `${c(accent)}│${RESET}`;
+    const leftW = Math.max(28, Math.floor(textW * 0.42));
+    const rightW = textW - leftW - 3;
+
+    const repoCells = repos.map((f, i) => {
+      const on = i === rsel;
+      const mark = on ? `${cText()}▶${RESET}` : " ";
+      const name = f.slug ? `${cAcc()}${f.label}${RESET}` : `${cAcc()}${ICONS.folder} ${tilde(f.cwd)}${RESET}`;
+      return spread(`${mark} ${on ? BOLD : ""}${name}`, `${DIM}${timeAgo(now - f.lastTs)}${RESET}`, leftW);
+    });
+    const leftLines = paneLines(
+      `${focusLeft ? BOLD + cText() : DIM}${t("prRepoHdr")}${RESET}${DIM}  ${repos.length} · ${t("last")}${RESET}`,
+      repoCells, rsel, bodyRows, `${DIM}${t("noFolderHistory")}${RESET}`,
+    );
+
+    const prCells = ui.prList.map((pr, i) => {
+      const on = !focusLeft && i === psel;
+      const mark = on ? `${cText()}▶${RESET}` : " ";
+      const draft = pr.isDraft ? `${cDim()} ✎${RESET}` : "";
+      const conflict = pr.mergeable === "CONFLICTING" ? ` ${cErr()}!${RESET}` : "";
+      const left = `${mark} ${on ? BOLD : ""}${cText2()}#${pr.number}${RESET} ${trunc(pr.title, Math.max(8, rightW - 22))}${draft}${conflict}`;
+      // the REST list endpoint may omit diff stats; show them when present, else the base branch
+      const meta = pr.changedFiles > 0
+        ? `+${pr.additions}/-${pr.deletions} ${pr.changedFiles}f`
+        : pr.baseRefName ? `→ ${pr.baseRefName}` : "";
+      return spread(left, `${DIM}${meta}${RESET}`, rightW);
+    });
+    const rightLines = paneLines(
+      `${!focusLeft ? BOLD + cText() : DIM}${t("prListHdr")}${RESET}${DIM}  ${ui.prList.length}${RESET}`,
+      prCells, psel, bodyRows, `${DIM}${t("prNoPrs")}${RESET}`,
+    );
+
+    const box: string[] = [];
+    box.push(B("╭") + rule(` ${title} `, ` ${DIM}${t("prPickTag")}${RESET} `, innerW, "─", accent) + B("╮"));
+    for (let i = 0; i < bodyRows; i++) {
+      box.push(B("│") + " " + pad(leftLines[i] ?? "", leftW) + " " + div + " " + pad(rightLines[i] ?? "", rightW) + " " + B("│"));
+    }
+    const hint = focusLeft
+      ? `${cText()}↑/↓${RESET}${DIM} ${t("issueRepoShort")}${RESET}  ${cText()}Tab/→${RESET}${DIM} PR${RESET}  ${cText()}Esc${RESET}${DIM} ${t("closeShort")}${RESET}`
+      : `${cText()}↑/↓${RESET}${DIM} PR${RESET}  ${cText()}⏎${RESET}${DIM} ${t("prAnalyzeVerb")}${RESET}  ${cText()}Tab/←${RESET}${DIM} ${t("issueRepoShort")}${RESET}  ${cText()}Esc${RESET}`;
+    box.push(B("├") + `${c(accent)}${"─".repeat(innerW)}${RESET}` + B("┤"));
+    box.push(B("│") + " " + pad(hint, textW) + " " + B("│"));
+    box.push(B("╰") + `${c(accent)}${"─".repeat(innerW)}${RESET}` + B("╯"));
+    return place(box);
+  }
+
+  // ── analyzing / commenting / merging / launching: spinner (+ elapsed) ──
+  if (ui.prStage === "analyzing" || ui.prStage === "commenting" || ui.prStage === "merging" || ui.prStage === "launching") {
+    const label =
+      ui.prStage === "analyzing" ? `${t("prAnalyzing")} ${c(accent)}${ui.prInstance || "?"}${RESET}${DIM} …${RESET}`
+      : ui.prStage === "commenting" ? t("prCommenting")
+      : ui.prStage === "merging" ? t("prMerging")
+      : t("prLaunching");
+    // analyzePR is headless → no token/tool stream; show wall-clock elapsed only.
+    const secs = ui.prStart ? Math.max(0, Math.round((now - ui.prStart) / 1000)) : 0;
+    const mid = [
+      center(`${c(accent)}${spin}${RESET}  ${label}`, textW),
+      "",
+      center(`${DIM}${tilde(ui.prRepoCwd)}${RESET}`, textW),
+      "",
+      ui.prStage === "analyzing" ? center(`${DIM}${secs}s${RESET}`, textW) : "",
+    ];
+    return frameBox(centered(mid), t("issueWorking"), `${cText()}Esc${RESET}${DIM} ${t("cancel")}${RESET}`);
+  }
+
+  // ── review: verdict header + findings + Markdown report ──
+  if (ui.prStage === "review" && ui.prAnalysis) {
+    const a = ui.prAnalysis;
+    const head: string[] = [
+      `${BOLD}${t("prRisk")}: ${c(riskColor(a.riskLevel))}●${RESET} ${c(riskColor(a.riskLevel))}${a.riskLevel}${RESET}   ${t("prMergeLabel")}: ${c(recColor(a.mergeRecommendation))}${a.mergeRecommendation}${RESET}`,
+      `${c(accent)}${"─".repeat(textW)}${RESET}`,
+    ];
+    const findingLines = a.findings.length
+      ? [
+          `${BOLD}${cText()}${t("prFindings")} (${a.findings.length})${RESET}`,
+          ...a.findings.flatMap((f) =>
+            wrapText(`[${f.category}/${f.severity}] ${f.title}${f.location ? ` (${f.location})` : ""}`, textW - 4)
+              .map((l, i) => (i === 0 ? "  • " : "    ") + `${cText2()}${l}${RESET}`)),
+          "",
+        ]
+      : [];
+    const body = renderMarkdown(a.report, textW - 2);
+    const all = [...head, ...findingLines, ...body];
+    const maxScroll = Math.max(0, all.length - bodyRows);
+    const scroll = Math.min(Math.max(0, ui.prScroll), maxScroll);
+    ui.prScroll = scroll;
+    const rows = all.slice(scroll, scroll + bodyRows);
+    while (rows.length < bodyRows) rows.push("");
+    const tag = `${DIM}${scroll > 0 ? "↑ " : ""}${scroll < maxScroll ? "↓ " : ""}#${a.pr.number} ${tilde(ui.prRepoCwd)}${RESET}`;
+    const hint = `${cText()}a${RESET}${DIM} ${t("prApprove")}${RESET}  ${cText()}c${RESET}${DIM} ${t("prComment")}${RESET}  ${cText()}r${RESET}${DIM} ${t("prRequestChanges")}${RESET}  ${cText()}m${RESET}${DIM} ${t("prMergeVerb")}${RESET}  ${cText()}s${RESET}${DIM} ${t("prStartSession")}${RESET}  ${cText()}↑/↓${RESET}${DIM} ${t("scroll")}${RESET}  ${cText()}Esc${RESET}`;
+    return frameBox(rows, tag, hint);
+  }
+
+  // ── action-input: review body for comment / request-changes ──
+  if (ui.prStage === "action-input") {
+    const rows: string[] = [
+      `${BOLD}${cText()}${t("prActionInputHdr")}${RESET}`,
+      "",
+      `${cOk()}❯${RESET} ${cText2()}${trunc(ui.prActionInput, textW - 4)}${RESET}${caret}`,
+    ];
+    while (rows.length < bodyRows) rows.push("");
+    return frameBox(rows, `${DIM}${tilde(ui.prRepoCwd)}${RESET}`, `${cText()}⏎${RESET}${DIM} ${t("send")}${RESET}  ${cText()}Esc${RESET}${DIM} ${t("back")}${RESET}`);
+  }
+
+  // ── done ──
+  if (ui.prStage === "done") {
+    const mid = [center(`${cOk()}✓ ${ui.prResult}${RESET}`, textW)];
+    return frameBox(centered(mid), `${DIM}${tilde(ui.prRepoCwd)}${RESET}`, `${cText()}Esc${RESET}${DIM} ${t("closeShort")}${RESET}`);
+  }
+
+  // ── error ──
+  const emid = [
+    center(`${cErr()}✗ ${t("prErr")}${RESET}`, textW),
+    "",
+    ...wrapText(ui.prError, textW - 4).map((l) => center(`${cText2()}${l}${RESET}`, textW)),
+  ];
+  return frameBox(centered(emid), `${DIM}${tilde(ui.prRepoCwd)}${RESET}`, `${cText()}r${RESET}${DIM} ${t("prRetry")}${RESET}  ${cText()}Esc${RESET}${DIM} ${t("closeShort")}${RESET}`);
+}
+
+/**
  * New-agent wizard, rendered as a centered POPUP over the dashboard (not a full
  * page). Two panes with two orientations (^T toggles):
  *  - instance→folder: pick a cloud (with 5h/weekly load), then a working folder
@@ -1751,11 +1948,15 @@ export function render(
     cmdPanes: [emptyPane(), emptyPane()], cmdRemote: null, cmdFeedback: "", fromCommander: false,
     issueStage: "pick", issuePane: "folder", issueFolderSel: 0, issueInput: "", issueFeedback: "",
     issueDraft: "", issueScroll: 0, issueRepo: "", issueInstance: "", issueUrl: "", issueError: "",
+    prStage: "pick", prPane: "repo", prRepoSel: 0, prPrSel: 0, prList: [], prRepoCwd: "",
+    prInstance: "", prAnalysis: null, prPendingAction: null, prActionInput: "", prResult: "",
+    prError: "", prScroll: 0, prStart: 0, prToken: 0,
   };
   // Overlays + full-screen views win over the Commander (the default surface).
   let out: string[];
   if (state.themePicker) out = renderThemePicker(states, frame, now, W, height, state, registry);
   else if (state.picker === "issue") out = renderIssueModal(states, registry, frame, now, W, height, state);
+  else if (state.picker === "pr") out = renderPrModal(states, registry, frame, now, W, height, state);
   else if (state.picker === "wizard") out = renderWizard(states, registry, frame, now, W, height, state);
   else if (state.picker === "cwd") out = renderPicker(states, frame, now, W, height, state);
   else if (state.cockpit && registry) out = renderCockpit(states, registry, frame, now, W, height, state);
