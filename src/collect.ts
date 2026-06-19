@@ -10,6 +10,7 @@ import {
   type WindowTotals,
 } from "./usage.ts";
 import type { SessState } from "./tracker.ts";
+import { stripHookJson } from "./transcript.ts";
 
 export interface SessionMeta {
   sessionId: string;
@@ -147,7 +148,7 @@ function describeMessage(
   let text = "";
   let tool: string | null = null;
   for (const part of content) {
-    if (part?.type === "text" && clean(part.text)) text = part.text;
+    if (part?.type === "text") { const t = stripHookJson(part.text || ""); if (clean(t)) text = t; }
     else if (part?.type === "tool_use" && part.name) tool = toolSummary(part.name, part.input);
   }
   if (tool) return { text: tool, kind: "tool" };
@@ -914,7 +915,7 @@ export function readTranscript(path: string, maxSegments = 800): TLine[] {
       }
     } else if (o.type === "assistant" && m && Array.isArray(m.content)) {
       for (const p of m.content) {
-        if (p?.type === "text") push("assistant", p.text || "");
+        if (p?.type === "text") push("assistant", stripHookJson(p.text || ""));
         else if (p?.type === "tool_use" && p.name) {
           const a = p.input?.command ?? p.input?.file_path ?? p.input?.path ?? p.input?.pattern ?? p.input?.description ?? "";
           push("tool", a ? `${p.name}: ${a}` : p.name);
